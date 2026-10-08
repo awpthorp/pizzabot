@@ -34,7 +34,12 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   try {
-    console.log(JSON.stringify(await runPizzaWorker()));
+    console.log(
+      JSON.stringify({
+        message: "PizzaBot recovery drain complete",
+        ...(await runPizzaWorker()),
+      }),
+    );
   } catch (error) {
     console.error(
       error instanceof Error ? error.message : "Pizza worker failed",

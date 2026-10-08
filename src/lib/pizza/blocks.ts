@@ -25,7 +25,9 @@ export function rewardsBlocks(rewards: Reward[], admin = false) {
       text: plain(
         admin
           ? "Reward catalogue"
-          : "Rewards: choose a reward to confirm redemption.",
+          : rewards.length
+            ? "Rewards: choose a reward to confirm redemption."
+            : "No rewards have been configured yet.",
       ),
     },
     ...(admin
