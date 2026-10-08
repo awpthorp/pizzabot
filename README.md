@@ -1,16 +1,24 @@
 # Grassroots PizzaBot
 
-A private Slack recognition app for Grassroots Creative Agency. Staff give 🍕 in
-one public recognition channel, view private balances and optionally share leaderboards, and redeem
-company rewards that configured admins fulfil manually. This is a standalone
-Next.js API service with its own Postgres database. Grassroots Assistant and the
-clients dashboard stay on their existing services. There is no dashboard UI or
-AI model dependency.
+An open-source Slack recognition bot built by [Grassroots Creative Agency](https://gr.agency). Give teammates 🍕, celebrate helpful work and redeem team rewards, all inside Slack. Fork it and run it in your own workspace under the [MIT license](LICENSE).
 
-Start with [PizzaBot, explained simply](docs/how-it-works.md) for the staff/admin
-mental model, or [Technical architecture](docs/architecture.md) for backend,
-hosting, data flows and maintenance. Staff instructions also live in the
-[Grassroots handbook](https://dash.gr.agency/handbook).
+**Free source code. Self-hosted.** You supply your own Slack app, backend hosting, dedicated PostgreSQL database and prizes. PizzaBot is a standalone Next.js API service, with no dashboard or AI model dependency. This version uses Asia/Dubai for daily resets and reports.
+
+- [Get PizzaBot and see what it does](https://gr.agency/free-tools/pizzabot)
+- [Set up your own installation](docs/self-hosting.md)
+- [PizzaBot, explained simply](docs/how-it-works.md)
+- [Technical architecture](docs/architecture.md)
+- [Contribute](CONTRIBUTING.md) · [Report a security issue](SECURITY.md)
+
+## What is in the box?
+
+- Peer recognition with a configurable daily giving allowance.
+- Separate lifetime recognition scores and available reward balances.
+- Weekly, monthly and all-time leaderboards for giving and receiving, including ties.
+- Explicit public leaderboard sharing and automatic weekly/monthly wrap-ups.
+- Editable prizes, slice prices, stock, goals and manual fulfilment/refunds.
+- Slack admin controls for allowance, size presets, reports and audited balance corrections.
+- Signed Slack requests, transaction-based accounting and durable background recovery.
 
 ## Recognition policy
 
@@ -56,7 +64,7 @@ The initial reward catalogue is empty. Admins add/edit/archive rewards via modal
 including positive integer slice cost, fulfilment description and optional stock.
 Add Small, Medium and Large open editable presets of 6, 8 and 12 slices; Custom
 keeps existing rewards valid. The tier is a label: changing it never silently
-changes the entered price. Georgia chooses the actual names, prizes and stock.
+changes the entered price. Your configured admins choose the actual names, prizes and stock.
 No tier promises a prize and no reward is seeded automatically.
 
 Staff can Track reward from the catalogue, switch goals, or clear a goal from
@@ -69,13 +77,13 @@ goals remain visible as unavailable until changed or cleared.
 
 Opening/cancelling a confirmation spends nothing. Submission checks current
 eligibility, stock and confirmed price, then debits once and creates a pending
-request. Price changes require renewed confirmation. Alex and Georgia receive
+request. Price changes require renewed confirmation. Configured admins receive
 admin controls; admins fulfil or cancel/refund pending requests. A fulfilled
 request cannot be cancelled. Request names/prices retain their original snapshot.
 
 ## Admin flexibility
 
-Alex and Georgia can use `/pizza admin settings` or Manage settings to set the
+Configured admins can use `/pizza admin settings` or Manage settings to set the
 daily giving limit (0–1000), new Small/Medium/Large preset costs (1–1000000, in
 any order), and weekly/monthly celebration switches. Defaults stay 5 per day and
 6/8/12 slices, with both report switches on. Preset changes update new modal
@@ -148,12 +156,12 @@ migration. Repeated apply executes no migration SQL. Never edit a migration afte
 
 ## Slack installation
 
-Use the separate PizzaBot app `A0C8JMFUETA` in workspace `T01G975PL7M`.
-`slack/pizza-manifest.json` uses
-`https://pizzabot-production-a20f.up.railway.app` for events, `/pizza`, and
-interactivity. Change all three URLs if the origin changes. The Events URL can
-verify with only `PIZZA_SIGNING_SECRET` configured while the feature is disabled.
-Normal mutations fail closed until all configuration is valid.
+Follow [the self-hosting guide](docs/self-hosting.md) to create your own Slack app.
+`slack/pizza-manifest.json` uses placeholder `https://pizzabot.example.com` URLs
+for events, `/pizza`, and interactivity. Replace all three with your own HTTPS
+origin. The Events URL can verify with only `PIZZA_SIGNING_SECRET` configured
+while the feature is disabled. Normal mutations fail closed until all
+configuration is valid.
 
 Install the app and explicitly invite it into public `#pizza` and private
 `#pizza-rewards-admin`. Scopes are `channels:history`, `channels:read`,
@@ -161,7 +169,7 @@ Install the app and explicitly invite it into public `#pizza` and private
 No automatic channel joins, email access, reactions, public distribution or
 Marketplace submission. Subscribe to `message.channels` and `user_change`.
 Upload `assets/pizzabot-icon.png` as the app icon (flat pizza slice generated with
-the built-in ImageGen tool). Do not change Assistant's app or Make.com URLs.
+the built-in ImageGen tool). Install a separate app for your own workspace.
 
 Set the names in `.env.example`: all IDs are server configuration; participant
 IDs are optional. Set a separate random `PIZZA_WORKER_SECRET` of at least 32
@@ -236,8 +244,8 @@ are safe.
 
 For a minimal CLI upload, upload this directory to the linked web service. Set
 the worker's Dockerfile path and cron settings before uploading the same source
-to the worker. Alternatively connect both services to the same private GitHub
-repository. Keep secrets in Railway variables; production credentials and database
+to the worker. Alternatively connect both services to your own GitHub
+fork. Keep secrets in Railway variables; production credentials and database
 snapshots never belong in Git.
 
 ## Delivery, retention and recovery
@@ -294,7 +302,7 @@ the scheme's lifetime. Logs use only safe error codes.
   Policy/correction mutation and race checks belong in disposable databases; do
   not change live defaults, balances or prizes just to test the controls.
 - Stop/restart the worker with pending work and confirm the independent cron
-  drains it. Confirm `/brain` and an existing Assistant button still work.
+  drains it. If your workspace has other bots, confirm their existing commands still work.
 - Pin the recognition policy in `#pizza`; introduce admin controls in the private
   admin channel. Keep the real catalogue empty until admins choose rewards.
 

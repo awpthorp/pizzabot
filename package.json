@@ -32,5 +32,6 @@
   },
   "overrides": {
     "vite": "8.1.5"
-  }
+  },
+  "license": "MIT"
 }

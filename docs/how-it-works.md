@@ -1,5 +1,7 @@
 # PizzaBot, explained simply
 
+This guide explains Grassroots' own PizzaBot installation. For your own workspace, start with [the self-hosting guide](self-hosting.md); choose your own channels, admins, rewards and hosting.
+
 PizzaBot is Grassroots' thank-you and rewards system. Everything staff and reward admins do happens in Slack. It does not require staff to open a separate website.
 
 However, Slack does not run our custom code or keep our slice balances. PizzaBot has its own small application and database on Railway. Slack is the front door; that application does the checking, counting and scheduling.

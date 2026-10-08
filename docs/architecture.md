@@ -4,7 +4,7 @@ Last documented: 8 October 2026. This document describes the deployed design; [t
 
 ## Boundaries and ownership
 
-PizzaBot is a standalone Next.js 16 API application on Node.js 22 with a dedicated PostgreSQL database. Its private repository is [awpthorp/pizzabot](https://github.com/awpthorp/pizzabot). Staff use Slack commands, Block Kit messages and modals. There is no PizzaBot website or dashboard frontend, and no LLM dependency.
+PizzaBot is a standalone Next.js 16 API application on Node.js 22 with a dedicated PostgreSQL database. Its MIT-licensed source repository is [awpthorp/pizzabot](https://github.com/awpthorp/pizzabot). Staff use Slack commands, Block Kit messages and modals. There is no PizzaBot website or dashboard frontend, and no LLM dependency.
 
 The `grassroots` repository serves `dash.gr.agency` and its staff handbook. The `gr-agency-clients` repository runs Grassroots Assistant / Brain. Neither stores PizzaBot's ledger or has a PizzaBot database connection. The connection is documentation: the staff docs export feeds the Brain's existing handbook ingestion.
 
@@ -30,7 +30,7 @@ The PizzaBot Railway project contains three services. The web and scheduled work
 | `pizza-worker` | Recover queued work and check report deadlines | `Dockerfile.worker`, `node scripts/run-pizza-worker.mjs`; cron `*/5 * * * *`, restart NEVER |
 | Postgres | Dedicated durable data store | Managed Railway PostgreSQL |
 
-Current web origin: `https://pizzabot-production-a20f.up.railway.app`.
+Set your own HTTPS web origin when deploying. The manifest uses `https://pizzabot.example.com` placeholders; replace them before installation.
 
 | Endpoint | Caller / purpose |
 | --- | --- |

@@ -12,9 +12,9 @@
     "slash_commands": [
       {
         "command": "/pizza",
-        "url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/commands",
+        "url": "https://pizzabot.example.com/api/slack/pizza/commands",
         "description": "Balance, leaderboard, rewards and help",
-        "usage_hint": "balance | leaderboard [month|all] | rewards | help | admin",
+        "usage_hint": "balance | leaderboard [share] [week|month|all] [received|given] | rewards | help | admin",
         "should_escape": true
       }
     ]
@@ -33,7 +33,7 @@
   },
   "settings": {
     "event_subscriptions": {
-      "request_url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/events",
+      "request_url": "https://pizzabot.example.com/api/slack/pizza/events",
       "bot_events": [
         "message.channels",
         "user_change"
@@ -41,7 +41,7 @@
     },
     "interactivity": {
       "is_enabled": true,
-      "request_url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/interactions"
+      "request_url": "https://pizzabot.example.com/api/slack/pizza/interactions"
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": false,
