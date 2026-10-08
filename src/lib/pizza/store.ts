@@ -266,6 +266,7 @@ export class PizzaStore {
           [job.team_id, a.giver, day, a.total],
         );
       }
+      const remaining = Math.max(0, settings.dailyLimit - used - a.total);
       await this.notify(
         client,
         job.team_id,
@@ -276,7 +277,7 @@ export class PizzaStore {
         {
           text:
             reject ??
-            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slices each (1 🍕 = 1 slice). You have ${Math.max(0, settings.dailyLimit - used - a.total)} left to give for ${day} (Asia/Dubai).`,
+            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slice${a.amount === 1 ? "" : "s"} each (1 🍕 = 1 slice).\n\n<@${a.giver}> has ${remaining === 0 ? "no more pizzas" : `${remaining} pizza${remaining === 1 ? "" : "s"}`} left to give for ${day} (Asia/Dubai).`,
         },
       );
       await this.complete(client, job, !!reject);
