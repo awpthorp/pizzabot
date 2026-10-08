@@ -160,20 +160,47 @@ export async function processJob(
       preview = true;
       result = celebrationPayload(p, snapshot, highlights, true);
     } else if (command === "leaderboard") {
-      const kind = words[1] ?? "month",
-        mode = words[2] ?? "received";
+      const args = words.slice(1);
+      const share = args[0] === "share" || args.at(-1) === "share";
+      if (args[0] === "share") args.shift();
+      else if (args.at(-1) === "share") args.pop();
+      const kind = args[0] ?? "month",
+        mode = args[1] ?? "received";
       if (
+        args.length > 2 ||
         !["week", "month", "all"].includes(kind) ||
         !["received", "given"].includes(mode)
       )
         throw new Refusal(
-          "Use /pizza leaderboard [week|month|all] [received|given].",
+          "Use /pizza leaderboard [share] [week|month|all] [received|given]. Add share to post publicly in the pizza channel; otherwise only you see the result.",
         );
+      if (share) {
+        if (job.payload.channel !== c.recognitionChannel)
+          throw new Refusal(
+            "Run /pizza leaderboard share in the pizza channel to share standings with the team.",
+          );
+        if (!(await api.channel(c.recognitionChannel, true)))
+          throw new Refusal(
+            "The public internal pizza channel is unavailable for sharing.",
+          );
+      }
       const p = period(kind as "week" | "month" | "all");
       const rows = await s.leaderboard(c.team, p, mode as "received" | "given");
       result = {
-        text: `${mode === "given" ? "Given" : "Received"} recognition leaderboard\n${p.label}\n${rows.map((r) => `${r.rank}. <@${r.user_id}> — ${r.slices} slices${mode === "given" ? ` · ${r.teammates} teammates thanked` : ""}`).join("\n") || "No recognition yet."}`,
+        text: `${mode === "given" ? "Given" : "Received"} recognition leaderboard\n${p.label}\n${rows.map((r) => `${r.rank}. <@${r.user_id}> — ${r.slices} slice${r.slices === 1 ? "" : "s"}${mode === "given" ? ` · ${r.teammates} teammate${r.teammates === 1 ? "" : "s"} thanked` : ""}`).join("\n") || "No recognition yet."}`,
       };
+      if (share) {
+        await s.shareLeaderboard(
+          job,
+          {
+            text: `🍕 ${result.text}\n\nShared by <@${user}>. Recognition totals; spending slices does not lower your score.`,
+            unfurl_links: false,
+            unfurl_media: false,
+          },
+          c,
+        );
+        return;
+      }
     } else if (command === "rewards" || command === "admin") {
       if (command === "admin" && !c.admins.includes(user))
         throw new Refusal("Only configured admins can manage rewards.");

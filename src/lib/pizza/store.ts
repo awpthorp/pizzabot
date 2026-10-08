@@ -970,6 +970,33 @@ export class PizzaStore {
       await this.complete(client, job);
     });
   }
+  async shareLeaderboard(
+    job: Job,
+    payload: Record<string, unknown>,
+    c: PizzaConfig,
+  ) {
+    return this.tx(async (client) => {
+      await this.guard(client, job);
+      if (
+        job.team_id !== c.team ||
+        job.kind !== "command" ||
+        job.payload.channel !== c.recognitionChannel
+      )
+        throw new Refusal(
+          "Leaderboards can only be shared from the pizza channel.",
+        );
+      await this.notify(
+        client, c.team, `leaderboard-share:${job.id}`,
+        { kind: "message", channel: c.recognitionChannel }, payload,
+      );
+      await this.notify(
+        client, c.team, `result:${job.id}`,
+        { kind: "ephemeral", channel: c.recognitionChannel, user: job.payload.user },
+        { text: "Your leaderboard is queued to appear in the pizza channel for everyone to see." },
+      );
+      await this.complete(client, job);
+    });
+  }
   async finish(
     job: Job,
     payload?: Record<string, unknown>,

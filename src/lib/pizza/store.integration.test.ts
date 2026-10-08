@@ -138,6 +138,29 @@ describe.skipIf(!dsn)(
         await admin.end();
       }
     });
+    it("commits one public leaderboard and private receipt atomically without accounting changes; retries cannot publish twice", async () => {
+      const command = await job("command", { user: "U2", channel: "C1", text: "leaderboard share", responseUrl: "https://hooks.slack.com/commands/test", responseExpires: Date.now() + 60000 });
+      const payload = { text: "Received recognition leaderboard\nNo recognition yet." };
+      await s.shareLeaderboard(command, payload, c);
+      await expect(s.shareLeaderboard(command, payload, c)).rejects.toBeInstanceOf(LostLease);
+      const rows = (await pool.query("SELECT notification_key,target,payload FROM pizza_outbox ORDER BY notification_key")).rows;
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ notification_key: `leaderboard-share:${command.id}`, target: { kind: "message", channel: "C1" }, payload });
+      expect(rows[1]).toMatchObject({ target: { kind: "ephemeral", channel: "C1", user: "U2" } });
+      expect((await pool.query("SELECT status FROM pizza_inbox WHERE id=$1", [command.id])).rows[0].status).toBe("complete");
+      expect((await pool.query("SELECT * FROM pizza_ledger")).rowCount).toBe(0);
+      expect((await pool.query("SELECT * FROM pizza_daily_usage")).rowCount).toBe(0);
+    });
+    it("cannot queue a public leaderboard for a different workspace or channel", async () => {
+      for (const changes of [{ channel: "G2" }, { channel: "D1" }]) {
+        const command = await job("command", { user: "U2", text: "leaderboard share", ...changes });
+        await expect(s.shareLeaderboard(command, { text: "standings" }, c)).rejects.toBeInstanceOf(Refusal);
+        await s.finish(command, { text: "refused" }, true);
+      }
+      const command = await job("command", { user: "U2", channel: "C1" });
+      await expect(s.shareLeaderboard(command, { text: "standings" }, { ...c, team: "T_OTHER" })).rejects.toBeInstanceOf(Refusal);
+      expect((await pool.query("SELECT * FROM pizza_outbox WHERE target->>'kind'='message'")).rowCount).toBe(0);
+    });
     it("allocates two per recipient, distinct lifetime/spendable/allowance and immutable ledger", async () => {
       await give(award("U1", ["U2", "U3"], 2));
       expect(await s.balance(c.team, "U2")).toMatchObject({

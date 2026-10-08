@@ -1,7 +1,7 @@
 # Grassroots PizzaBot
 
 A private Slack recognition app for Grassroots Creative Agency. Staff give 🍕 in
-one public recognition channel, view private balances/leaderboards, and redeem
+one public recognition channel, view private balances and optionally share leaderboards, and redeem
 company rewards that configured admins fulfil manually. This is a standalone
 Next.js API service with its own Postgres database. Grassroots Assistant and the
 clients dashboard stay on their existing services. There is no dashboard UI or
@@ -37,6 +37,13 @@ timestamps, independently of spending. Ties share ranks (1, 1, 3), with stable
 Slack ID order within ties. Weeks run Friday 16:00 to the next Friday 16:00 in
 Asia/Dubai; months use the Dubai calendar. Every bounded leaderboard prints its
 exact dates, including the exclusive end.
+
+`/pizza leaderboard share` posts this month's received standings publicly.
+`/pizza leaderboard share week given` shares weekly giving; `month`/`all` and
+`received`/`given` also work. `share` can appear first or last among the options.
+Sharing must be invoked in the configured public pizza channel by eligible staff.
+The top ten rankings show recognition totals, ties and who shared them, without
+spendable balances, goals or reward details. Commands without `share` stay private.
 
 `/pizza admin` shows Manage settings, Adjust balance, reward controls, pending
 requests, and ambiguous notifications.

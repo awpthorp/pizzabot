@@ -49,6 +49,8 @@ Small, Medium and Large are editable reward labels. Their launch preset costs ar
 
 `/pizza leaderboard` shows this month's received slices. Add `week`, `month` or `all`, and optionally `given`, for example `/pizza leaderboard week given`. Giving standings also show how many different teammates each person thanked. Ties share a rank.
 
+These checks are private unless you explicitly add `share`: run `/pizza leaderboard share` in **#pizza** to post this month's received standings for everyone. Use `/pizza leaderboard share week given` for this week's givers, or choose `week`, `month` or `all` and `received` or `given`. The public post shows the top ten rankings and who shared it. Sharing from DMs or other channels is refused privately. Balances, rewards, goals and admin commands stay private.
+
 The weekly celebration covers Friday 16:00 to the next Friday 16:00 Dubai time. The next five-minute worker run posts the completed week's wrap-up after Friday 16:00. The monthly wrap-up is due after 10:00 Dubai on the first day of the next month. Admins can switch each report off separately.
 
 Wrap-ups celebrate the top receivers and givers, including tied winners, show team totals and can include two real thank-you excerpts with links. Winning a leaderboard does not automatically award a prize. Rewards still use the catalogue and redemption process.

@@ -23,6 +23,7 @@ const fixtures = () => {
     adminHistory: vi.fn().mockResolvedValue([]),
     retry: vi.fn(),
     finish: vi.fn(),
+    shareLeaderboard: vi.fn(),
     award: vi.fn(),
     redeem: vi.fn(),
     adminAction: vi.fn(),
@@ -285,7 +286,7 @@ describe("recoverable worker", () => {
       expect.anything(),
       expect.objectContaining({
         text: expect.stringContaining(
-          "1. <@U1> — 5 slices · 2 teammates thanked\n1. <@U3> — 5 slices · 3 teammates thanked\n3. <@U4> — 2 slices · 1 teammates thanked",
+          "1. <@U1> — 5 slices · 2 teammates thanked\n1. <@U3> — 5 slices · 3 teammates thanked\n3. <@U4> — 2 slices · 1 teammate thanked",
         ),
       }),
     );
@@ -300,6 +301,48 @@ describe("recoverable worker", () => {
       );
     }
     expect(f.storage.leaderboard).not.toHaveBeenCalled();
+  });
+  it("only explicit valid leaderboard sharing publishes, with defaults or period/view options", async () => {
+    for (const [text, kind, mode] of [
+      ["leaderboard share", "month", "received"],
+      ["leaderboard share week given", "week", "given"],
+      ["leaderboard all received share", "all", "received"],
+    ]) {
+      const f = fixtures(), command = { ...j, payload: { ...j.payload, text } };
+      await processJob(f.s, f.slack, c, command);
+      expect(f.api.channel).toHaveBeenCalledWith("C1", true);
+      expect(f.storage.leaderboard).toHaveBeenCalledWith("T1", expect.objectContaining({ kind }), mode);
+      expect(f.storage.shareLeaderboard).toHaveBeenCalledWith(command, expect.objectContaining({ text: expect.stringContaining("Shared by <@U2>") }), c);
+      expect(f.storage.finish).not.toHaveBeenCalled();
+    }
+  });
+  it("rejects sharing from other channels, unsafe channels, and ineligible staff privately", async () => {
+    for (const channel of ["G2", "D1", "C_OTHER"]) {
+      const f = fixtures(), command = { ...j, payload: { ...j.payload, channel, text: "leaderboard share" } };
+      await processJob(f.s, f.slack, c, command);
+      expect(f.storage.finish).toHaveBeenCalledWith(command, expect.objectContaining({ text: expect.stringContaining("Run /pizza leaderboard share in") }), true);
+      expect(f.storage.shareLeaderboard).not.toHaveBeenCalled();
+      expect(f.storage.leaderboard).not.toHaveBeenCalled();
+    }
+    for (const scenario of ["unsafe", "guest", "transient"]) {
+      const f = fixtures(), command = { ...j, payload: { ...j.payload, text: "leaderboard share" } };
+      if (scenario === "unsafe") f.api.channel.mockResolvedValue(false);
+      if (scenario === "guest") f.api.identity.mockResolvedValue({ id: "U2", team_id: "T1", is_restricted: true } as never);
+      if (scenario === "transient") f.api.channel.mockRejectedValue(new SlackTransient("channel_unknown"));
+      await processJob(f.s, f.slack, c, command);
+      expect(f.storage.shareLeaderboard).not.toHaveBeenCalled();
+      expect(f.storage.leaderboard).not.toHaveBeenCalled();
+      if (scenario === "transient") expect(f.storage.retry).toHaveBeenCalled();
+      else expect(f.storage.finish).toHaveBeenCalledWith(command, expect.anything(), true);
+    }
+  });
+  it("keeps ordinary leaderboards and sensitive commands private, and refuses malformed sharing", async () => {
+    for (const text of ["leaderboard", "leaderboard week given", "balance share", "rewards share", "admin share", "leaderboard share share", "leaderboard week share given", "leaderboard share month spent", "leaderboard share week given extra"]) {
+      const f = fixtures();
+      await processJob(f.s, f.slack, c, { ...j, payload: { ...j.payload, text } });
+      expect(f.storage.shareLeaderboard).not.toHaveBeenCalled();
+      expect(f.storage.finish).toHaveBeenCalled();
+    }
   });
   it("settings/adjustment jobs freshly validate actor and recipient; stale/refused changes remain private in the admin channel", async () => {
     const f = fixtures(),

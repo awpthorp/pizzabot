@@ -50,6 +50,12 @@ Slack uses the separate PizzaBot app configured in `slack/pizza-manifest.json`. 
 4. One transaction locks affected accounts in deterministic order and applies allowance, allocations, available/earned balances, ledger records and notification jobs. Stable event/message keys prevent repeat accounting.
 5. Slack delivery occurs outside database locks. The outbox records delivery status separately from accepted accounting.
 
+## Public leaderboard sharing
+
+Normal slash command replies are private. Only `leaderboard share` (with optional period and received/given view) queues a public standings message. The worker checks staff eligibility, requires the invoking channel to match the configured recognition channel, and validates it is public, internal, unshared and available to the bot.
+
+`shareLeaderboard` atomically queues a bounded top-ten snapshot with a `leaderboard-share:<job ID>` deduplication key, a private receipt, and job completion under the existing inbox lease. It does not mutate accounts, allowance, ledger, goals or reports. Delivery revalidates the configured channel and uses the existing outbox retry and ambiguous-delivery reconciliation. The receipt says queued because the public Slack delivery happens separately.
+
 ## Reward and admin flows
 
 A redemption uses a persisted confirmation intent bound to the user and displayed price. On submission, the backend rechecks current eligibility, price and stock. A single transaction debits the account, consumes stock, creates the request and queues notifications. A changed price requires a new confirmation.
