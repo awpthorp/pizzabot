@@ -267,6 +267,7 @@ export class PizzaStore {
         );
       }
       const remaining = Math.max(0, settings.dailyLimit - used - a.total);
+      const dayLabel = day === localDay() ? "today" : `for ${day} (Dubai time)`;
       await this.notify(
         client,
         job.team_id,
@@ -277,7 +278,7 @@ export class PizzaStore {
         {
           text:
             reject ??
-            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slice${a.amount === 1 ? "" : "s"} each (1 🍕 = 1 slice).\n\n<@${a.giver}> has ${remaining === 0 ? "no more pizzas" : `${remaining} pizza${remaining === 1 ? "" : "s"}`} left to give for ${day} (Asia/Dubai).`,
+            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slice${a.amount === 1 ? "" : "s"} each (1 🍕 = 1 slice).\n\n<@${a.giver}> has ${remaining === 0 ? "no more pizzas" : `${remaining} pizza${remaining === 1 ? "" : "s"}`} left to give ${dayLabel}.`,
         },
       );
       await this.complete(client, job, !!reject);
