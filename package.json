@@ -1,0 +1,36 @@
+{
+  "name": "grassroots-pizzabot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3003",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
+    "test": "vitest run",
+    "test:worker": "node --test scripts/run-pizza-worker.node-test.mjs",
+    "test:migrations": "node --test scripts/migration-runner-core.node-test.mjs",
+    "typecheck": "tsc --noEmit --incremental false",
+    "verify": "npm test && npm run test:worker && npm run test:migrations && npm run typecheck",
+    "worker": "node scripts/run-pizza-worker.mjs",
+    "migrate": "node scripts/migrate.mjs",
+    "migrate:status": "node scripts/migrate.mjs --status"
+  },
+  "dependencies": {
+    "@slack/web-api": "7.19.0",
+    "next": "16.2.11",
+    "pg": "8.13.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5",
+    "vitest": "4.1.10"
+  },
+  "overrides": {
+    "vite": "8.1.5"
+  }
+}

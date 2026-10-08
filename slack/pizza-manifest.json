@@ -1,0 +1,50 @@
+{
+  "display_information": {
+    "name": "PizzaBot",
+    "description": "Recognise teammates with pizzas and redeem company rewards",
+    "background_color": "#e26d32"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "PizzaBot",
+      "always_online": false
+    },
+    "slash_commands": [
+      {
+        "command": "/pizza",
+        "url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/commands",
+        "description": "Balance, leaderboard, rewards and help",
+        "usage_hint": "balance | leaderboard [month|all] | rewards | help | admin",
+        "should_escape": true
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:history",
+        "channels:read",
+        "groups:read",
+        "chat:write",
+        "users:read",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/events",
+      "bot_events": [
+        "message.channels",
+        "user_change"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://pizzabot-production-a20f.up.railway.app/api/slack/pizza/interactions"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "is_hosted": false
+  }
+}
