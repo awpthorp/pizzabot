@@ -7,6 +7,11 @@ Next.js API service with its own Postgres database. Grassroots Assistant and the
 clients dashboard stay on their existing services. There is no dashboard UI or
 AI model dependency.
 
+Start with [PizzaBot, explained simply](docs/how-it-works.md) for the staff/admin
+mental model, or [Technical architecture](docs/architecture.md) for backend,
+hosting, data flows and maintenance. Staff instructions also live in the
+[Grassroots handbook](https://dash.gr.agency/handbook).
+
 ## Recognition policy
 
 The default is five pizzas to give per original message's Asia/Dubai calendar
