@@ -1,13 +1,14 @@
-import {
-  TIERS,
-  tierLabel,
-  progressMeter,
-  tierGuide,
-  type Tier,
-} from "./rewards";
+import { TIERS, tierLabel, progressMeter, type Tier } from "./rewards";
 import type { Reward } from "./store";
-export const help =
-  "Give recognition in the pizza channel: <@USER> 🍕 thanks! Every unique direct mention receives the total pizzas in the text: @Mike @Sarah 🍕🍕 costs four. Five to give per Dubai calendar day; receiving never replenishes giving. No self gifts, guests, bots, external users, code, quotes, attachments, edits or reactions. Original thread replies count. Editing/deleting an accepted message does not alter earned slices. One received 🍕 is one slice. Redemption spends available slices but never lifetime earned. /pizza balance | leaderboard [week|month|all] [received|given] | rewards | goal clear | help. Track a reward for personal progress; tracking never spends slices. Admins: /pizza admin and /pizza admin preview [week|month].";
+import {
+  DEFAULT_SETTINGS,
+  presetCosts,
+  settingsSummary,
+  type PizzaSettings,
+} from "./settings";
+export function help(settings: PizzaSettings = DEFAULT_SETTINGS) {
+  return `Give recognition in the pizza channel: <@USER> 🍕 thanks! Every unique direct mention receives the total pizzas in the text: @Mike @Sarah 🍕🍕 costs four. ${settings.dailyLimit} to give per Dubai calendar day${settings.dailyLimit === 0 ? " (giving paused)" : ""}; receiving never replenishes giving. No self gifts, guests, bots, external users, code, quotes, attachments, edits or reactions. Original thread replies count. Editing/deleting an accepted message does not alter earned slices. One received 🍕 is one slice. Redemption spends available slices but never lifetime earned. /pizza balance | leaderboard [week|month|all] [received|given] | rewards | goal clear | help. Track a reward for personal progress; tracking never spends slices. Admins: /pizza admin settings | history [page] | preview [week|month].`;
+}
 const plain = (text: string) => ({
   type: "plain_text",
   text: text.slice(0, 2000),
@@ -18,7 +19,11 @@ export const button = (text: string, action_id: string, value: string) => ({
   action_id,
   value,
 });
-export function rewardsBlocks(rewards: Reward[], admin = false) {
+export function rewardsBlocks(
+  rewards: Reward[],
+  admin = false,
+  settings: PizzaSettings = DEFAULT_SETTINGS,
+) {
   return [
     {
       type: "section",
@@ -36,7 +41,7 @@ export function rewardsBlocks(rewards: Reward[], admin = false) {
             type: "actions",
             elements: [
               button("Add custom", "pizza_add", "new"),
-              ...Object.entries(TIERS).map(([tier, cost]) =>
+              ...Object.entries(presetCosts(settings)).map(([tier, cost]) =>
                 button(
                   `Add ${tierLabel(tier as Tier)} (${cost})`,
                   `pizza_add_${tier}`,
@@ -125,7 +130,12 @@ export function confirmationModal(intent: string, r: Reward, balance: number) {
     ],
   };
 }
-export function rewardModal(r?: Reward, preset?: Tier) {
+export function rewardModal(
+  r?: Reward,
+  preset?: Tier,
+  settings: PizzaSettings = DEFAULT_SETTINGS,
+) {
+  const costs = presetCosts(settings);
   const input = (
     id: string,
     label: string,
@@ -147,7 +157,7 @@ export function rewardModal(r?: Reward, preset?: Tier) {
     text: plain(
       tier === "custom"
         ? "Custom"
-        : `${tierLabel(tier as Tier)} (guide: ${TIERS[tier as Tier]} slices)`,
+        : `${tierLabel(tier as Tier)} (guide: ${costs[tier as Tier]} slices)`,
     ),
     value: tier,
   }));
@@ -174,7 +184,7 @@ export function rewardModal(r?: Reward, preset?: Tier) {
       input(
         "cost",
         "Cost in slices (edit explicitly)",
-        r ? String(r.cost) : preset ? String(TIERS[preset]) : "",
+        r ? String(r.cost) : preset ? String(costs[preset]) : "",
       ),
       {
         type: "context",
@@ -200,8 +210,13 @@ export function rewardModal(r?: Reward, preset?: Tier) {
   };
 }
 
-export function goalText(balance: number, reward: Reward | null): string {
-  if (!reward) return tierGuide;
+export function goalText(
+  balance: number,
+  reward: Reward | null,
+  settings: PizzaSettings = DEFAULT_SETTINGS,
+): string {
+  if (!reward)
+    return `Reward tiers: Small ${settings.smallCost} slices · Medium ${settings.mediumCost} slices · Large ${settings.largeCost} slices. Admins choose the actual prizes; costs may be customised. Use /pizza rewards to track a reward.`;
   const availability = !reward.active
     ? "This goal is archived."
     : reward.stock === 0
@@ -214,4 +229,155 @@ export function goalText(balance: number, reward: Reward | null): string {
     `${balance}/${reward.cost} available slices. ${availability || (remaining ? `${remaining} more slices to reach the current cost.` : "Ready to redeem via /pizza rewards.")}`,
     "Tracking never spends or reserves slices. Use /pizza rewards to change your goal or /pizza goal clear to remove it.",
   ].join("\n");
+}
+
+export function adminControls() {
+  return {
+    type: "actions",
+    elements: [
+      button("Manage settings", "pizza_settings", "open"),
+      button("Adjust balance", "pizza_adjust", "open"),
+    ],
+  };
+}
+export function settingsBlocks(settings: PizzaSettings) {
+  return [
+    { type: "section", text: plain(settingsSummary(settings)) },
+    adminControls(),
+  ];
+}
+const modalInput = (id: string, label: string, value?: string) => ({
+  type: "input",
+  block_id: id,
+  label: plain(label),
+  element: {
+    type: "plain_text_input",
+    action_id: "value",
+    ...(value !== undefined ? { initial_value: value } : {}),
+  },
+});
+export function settingsModal(settings: PizzaSettings) {
+  const toggle = (id: string, label: string, enabled: boolean) => {
+    const options = [
+      { text: plain("On"), value: "on" },
+      { text: plain("Off"), value: "off" },
+    ];
+    return {
+      type: "input",
+      block_id: id,
+      label: plain(label),
+      element: {
+        type: "static_select",
+        action_id: "value",
+        options,
+        initial_option: options[enabled ? 0 : 1],
+      },
+    };
+  };
+  return {
+    type: "modal" as const,
+    callback_id: "pizza_settings_save",
+    private_metadata: String(settings.version),
+    title: plain("Manage settings"),
+    submit: plain("Save"),
+    close: plain("Cancel"),
+    blocks: [
+      {
+        type: "section",
+        text: plain(
+          "Changes affect subsequently processed recognition. Used allowance stays consumed. Presets affect new prizes only; existing prices stay unchanged. Weekly reports run Friday 4pm Dubai; monthly reports run on the first day at 10am Dubai. Already queued messages may still arrive.",
+        ),
+      },
+      modalInput(
+        "dailyLimit",
+        "Daily giving limit (0–1000)",
+        String(settings.dailyLimit),
+      ),
+      ...(["smallCost", "mediumCost", "largeCost"] as const).map((k) =>
+        modalInput(
+          k,
+          `${k.slice(0, -4)} preset slices (1–1000000)`,
+          String(settings[k]),
+        ),
+      ),
+      toggle("weeklyEnabled", "Weekly celebrations", settings.weeklyEnabled),
+      toggle("monthlyEnabled", "Monthly celebrations", settings.monthlyEnabled),
+    ],
+  };
+}
+export function adjustmentModal() {
+  return {
+    type: "modal" as const,
+    callback_id: "pizza_adjust_save",
+    title: plain("Adjust balance"),
+    submit: plain("Apply"),
+    close: plain("Cancel"),
+    blocks: [
+      {
+        type: "section",
+        text: plain(
+          "Adjust available slices only, without changing earned recognition, leaderboards or giving allowance. Enter a signed nonzero integer (±1000000 maximum). The selected staff member and admin receive a private receipt with the reason.",
+        ),
+      },
+      {
+        type: "input",
+        block_id: "recipient",
+        label: plain("Staff recipient"),
+        element: {
+          type: "users_select",
+          action_id: "value",
+          placeholder: plain("Choose eligible staff"),
+        },
+      },
+      modalInput("delta", "Slice adjustment (+ or -)"),
+      {
+        ...modalInput("reason", "Reason (required, up to 500 characters)"),
+        element: {
+          type: "plain_text_input",
+          action_id: "value",
+          multiline: true,
+          min_length: 1,
+          max_length: 500,
+        },
+      },
+    ],
+  };
+}
+export function historyBlocks(rows: Record<string, unknown>[], page: number) {
+  const compact = (value: unknown) => {
+    const v = value as PizzaSettings;
+    return `Giving ${v.dailyLimit}/day · presets ${v.smallCost}/${v.mediumCost}/${v.largeCost} slices · weekly ${v.weeklyEnabled ? "on" : "off"} · monthly ${v.monthlyEnabled ? "on" : "off"}`;
+  };
+  return [
+    {
+      type: "section",
+      text: plain(
+        `Admin history · page ${page}. /pizza admin history [page] (pages start at 0).`,
+      ),
+    },
+    ...rows.flatMap((r) => [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            r.kind === "settings"
+              ? `<@${r.actor}> updated settings · ${new Date(String(r.created_at)).toISOString()}`
+              : `<@${r.actor}> adjusted <@${r.recipient}>'s available slices: ${r.before_balance} → ${r.after_balance} (${Number(r.delta) > 0 ? "+" : ""}${r.delta}) · ${new Date(String(r.created_at)).toISOString()}`,
+        },
+      },
+      {
+        type: "section",
+        text: plain(
+          r.kind === "settings"
+            ? `Before: ${compact(r.old_values)}\nAfter: ${compact(r.new_values)}`
+            : `Reason: ${r.reason}`,
+        ),
+      },
+      { type: "context", elements: [plain(`Reference: ${r.job_id}`)] },
+    ]),
+    ...(rows.length
+      ? []
+      : [{ type: "section", text: plain("No admin history on this page.") }]),
+  ];
 }

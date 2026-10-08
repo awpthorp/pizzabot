@@ -7,6 +7,9 @@ import {
   redemptionBlocks,
   goalText,
   button,
+  adminControls,
+  settingsBlocks,
+  historyBlocks,
 } from "./blocks";
 import { period } from "./periods";
 import {
@@ -57,9 +60,23 @@ export async function processJob(
       return;
     }
     const user = String(job.payload.user),
-      identity = await api.identity(user);
+      identity = await api.identity(
+        user,
+        job.kind === "settings" || job.kind === "adjustment",
+      );
     if (!eligible(identity, c))
       throw new Refusal("Only eligible workspace staff can use PizzaBot.");
+    if (job.kind === "settings") {
+      await s.saveSettings(job, identity, c);
+      return;
+    }
+    if (job.kind === "adjustment") {
+      if (!c.admins.includes(user))
+        throw new Refusal("Only configured admins can adjust balances.");
+      const target = await api.identity(String(job.payload.recipient), true);
+      await s.adjustBalance(job, identity, target, c);
+      return;
+    }
     if (job.kind === "redeem") {
       if (!(await api.channel(c.adminChannel, false)))
         throw new Refusal("Reward admin channel is unavailable or shared.");
@@ -83,12 +100,13 @@ export async function processJob(
         .trim()
         .split(/\s+/),
       command = words[0] || "balance";
+    const settings = await s.settings(c.team);
     let result: Record<string, unknown>;
     let preview = false;
     if (command === "balance") {
       const b = await s.balance(c.team, user),
         goal = await s.goal(c.team, user);
-      const text = `Lifetime earned: ${b.earned} slices\nAvailable to spend: ${b.balance} slices\nLeft to give today: ${b.remaining}/${5} 🍕\nReset: midnight Asia/Dubai. One received 🍕 = one slice.\n\n${goalText(b.balance, goal)}`;
+      const text = `Lifetime earned: ${b.earned} slices\nAvailable to spend: ${b.balance} slices\nLeft to give today: ${b.remaining}/${b.dailyLimit} 🍕\nReset: midnight Asia/Dubai. One received 🍕 = one slice.\n\n${goalText(b.balance, goal, settings)}`;
       result = {
         text,
         blocks: [
@@ -103,7 +121,7 @@ export async function processJob(
             : []),
         ],
       };
-    } else if (command === "help") result = { text: help };
+    } else if (command === "help") result = { text: help(settings) };
     else if (command === "goal" && words[1] === "clear") {
       await s.setGoal(
         { ...job, payload: { ...job.payload, reward: null } },
@@ -111,6 +129,25 @@ export async function processJob(
         c,
       );
       return;
+    } else if (
+      command === "admin" &&
+      ["settings", "history"].includes(words[1])
+    ) {
+      if (!c.admins.includes(user))
+        throw new Refusal(
+          "Only configured admins can view admin settings/history.",
+        );
+      if (words[1] === "settings")
+        result = { text: "Pizza settings", blocks: settingsBlocks(settings) };
+      else {
+        if (words[2] !== undefined && !/^\d{1,4}$/.test(words[2]))
+          throw new Refusal("Use /pizza admin history [page], starting at 0.");
+        const page = Number(words[2] ?? 0);
+        result = {
+          text: "Private admin history",
+          blocks: historyBlocks(await s.adminHistory(c.team, page), page),
+        };
+      }
     } else if (command === "admin" && words[1] === "preview") {
       if (!c.admins.includes(user))
         throw new Refusal("Only configured admins can preview celebrations.");
@@ -168,23 +205,24 @@ export async function processJob(
           type: "section",
           text: {
             type: "plain_text",
-            text: `Admin view. /pizza admin preview [week|month] gives a private current-period preview. /pizza admin requests [page] or deliveries [page] or rewards [page] (pages start at 0). Pending request actions work even when the original notification is ambiguous.`,
+            text: `Admin view. Manage settings and Adjust balance controls below. /pizza admin settings or history [page]. /pizza admin preview [week|month] gives a private current-period preview. /pizza admin requests [page] or deliveries [page] or rewards [page] (pages start at 0). Pending request actions work even when the original notification is ambiguous.`,
           },
         };
         result = {
           text: "Pizza admin",
           blocks:
             words[1] === "rewards"
-              ? [guide, ...rewardsBlocks(rows, true)]
+              ? [guide, ...rewardsBlocks(rows, true, settings)]
               : words[1] === "requests"
                 ? [guide, ...requests]
                 : words[1] === "deliveries"
                   ? [guide, ...deliveries]
                   : [
                       guide,
-                      ...rewardsBlocks(rows.slice(0, 8), true),
+                      adminControls(),
+                      ...rewardsBlocks(rows.slice(0, 7), true, settings),
                       ...state.requests
-                        .slice(0, 8)
+                        .slice(0, 7)
                         .flatMap((r) =>
                           redemptionBlocks(
                             r.id,
@@ -204,7 +242,7 @@ export async function processJob(
             : "No rewards have been configured yet.",
           blocks: rewardsBlocks(rows),
         };
-    } else result = { text: help };
+    } else result = { text: help(settings) };
     if (preview) await s.finish(job, result, false, "preview");
     else await s.finish(job, result);
   } catch (error) {

@@ -4,8 +4,10 @@ import { POST as events } from "./events/route";
 import { POST as commands } from "./commands/route";
 import { POST as interactions } from "./interactions/route";
 import { POST as drainRoute } from "./drain/route";
+import { DEFAULT_SETTINGS } from "@/lib/pizza/settings";
 import { Refusal } from "@/lib/pizza/store";
 const mock = vi.hoisted(() => ({
+  settings: vi.fn(),
   after: vi.fn(),
   enqueue: vi.fn(),
   intent: vi.fn(),
@@ -88,6 +90,7 @@ function form(body: unknown) {
 beforeEach(() => {
   vi.resetAllMocks();
   Object.entries(env).forEach(([key, value]) => vi.stubEnv(key, value));
+  mock.settings.mockResolvedValue({ ...DEFAULT_SETTINGS });
   mock.identity.mockResolvedValue({ id: "U2", team_id: "T1" });
   mock.intent.mockResolvedValue({
     id,
@@ -445,5 +448,259 @@ describe("signed durable Slack routes", () => {
       actions: [{ action_id: "pizza_goal", value: id }],
     });
     expect((await interactions(request(form(foreign), true))).status).toBe(403);
+  });
+  it("opens admin controls with current revision/preset defaults and denies nonadmins and ineligible admins", async () => {
+    mock.settings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      version: 8,
+      smallCost: 25,
+    });
+    mock.identity.mockResolvedValue({ id: "U9", team_id: "T1" });
+    for (const action of [
+      "pizza_settings",
+      "pizza_adjust",
+      "pizza_add_small",
+    ]) {
+      const response = await interactions(
+        request(
+          form(
+            interaction({
+              user: { id: "U9" },
+              actions: [{ action_id: action, value: "open" }],
+            }),
+          ),
+          true,
+        ),
+      );
+      expect(response.status).toBe(200);
+    }
+    expect(mock.modal.mock.calls[0][1]).toMatchObject({
+      callback_id: "pizza_settings_save",
+      private_metadata: "8",
+    });
+    expect(JSON.stringify(mock.modal.mock.calls[1][1])).toContain(
+      '"type":"users_select"',
+    );
+    expect(JSON.stringify(mock.modal.mock.calls[2][1])).toContain(
+      '"initial_value":"25"',
+    );
+    mock.modal.mockClear();
+    mock.identity.mockResolvedValue({ id: "U2", team_id: "T1" });
+    expect(
+      (
+        await interactions(
+          request(
+            form(
+              interaction({
+                actions: [{ action_id: "pizza_settings", value: "open" }],
+              }),
+            ),
+            true,
+          ),
+        )
+      ).status,
+    ).toBe(403);
+    mock.identity.mockResolvedValue({
+      id: "U9",
+      team_id: "T1",
+      is_restricted: true,
+    });
+    expect(
+      (
+        await interactions(
+          request(
+            form(
+              interaction({
+                user: { id: "U9" },
+                actions: [{ action_id: "pizza_adjust", value: "open" }],
+              }),
+            ),
+            true,
+          ),
+        )
+      ).status,
+    ).toBe(200);
+    expect(mock.modal).not.toHaveBeenCalled();
+    expect(mock.interactionFeedback).toHaveBeenCalledWith(
+      "T1",
+      expect.any(String),
+      "U9",
+      expect.any(String),
+      expect.any(String),
+      expect.stringContaining("eligible"),
+    );
+  });
+  it("settings submissions validate every value/toggle and metadata before durable signed-actor enqueue", async () => {
+    const numeric = (value: string) => ({ value: { value } }),
+      toggle = (value: string) => ({ value: { selected_option: { value } } });
+    const values = {
+      dailyLimit: numeric("0"),
+      smallCost: numeric("20"),
+      mediumCost: numeric("2"),
+      largeCost: numeric("1"),
+      weeklyEnabled: toggle("off"),
+      monthlyEnabled: toggle("on"),
+    };
+    const body = interaction({
+      type: "view_submission",
+      user: { id: "U9" },
+      channel: { id: "CFAKE" },
+      view: {
+        id: "Vsettings",
+        callback_id: "pizza_settings_save",
+        private_metadata: "4",
+        state: { values },
+      },
+    });
+    expect(
+      await (await interactions(request(form(body), true))).json(),
+    ).toEqual({ response_action: "clear" });
+    expect(mock.enqueue).toHaveBeenLastCalledWith(
+      "T1",
+      expect.any(String),
+      "settings",
+      {
+        user: "U9",
+        channel: "G2",
+        version: 4,
+        values: {
+          dailyLimit: 0,
+          smallCost: 20,
+          mediumCost: 2,
+          largeCost: 1,
+          weeklyEnabled: false,
+          monthlyEnabled: true,
+        },
+      },
+    );
+    mock.enqueue.mockClear();
+    const bad = {
+      ...body,
+      view: {
+        ...body.view,
+        state: {
+          values: {
+            ...values,
+            dailyLimit: numeric("1001"),
+            smallCost: numeric("0"),
+            mediumCost: numeric("1.5"),
+            largeCost: numeric("1000001"),
+            weeklyEnabled: toggle("maybe"),
+          },
+        },
+      },
+    };
+    expect(
+      (await (await interactions(request(form(bad), true))).json()).errors,
+    ).toEqual({
+      dailyLimit: expect.any(String),
+      smallCost: expect.any(String),
+      mediumCost: expect.any(String),
+      largeCost: expect.any(String),
+      weeklyEnabled: expect.any(String),
+    });
+    expect(
+      (
+        await interactions(
+          request(
+            form({
+              ...body,
+              view: {
+                ...body.view,
+                private_metadata: '{"user":"U9","version":4}',
+              },
+            }),
+            true,
+          ),
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (await interactions(request(form({ ...body, user: { id: "U2" } }), true)))
+        .status,
+    ).toBe(403);
+    expect(
+      (
+        await interactions(
+          request(form(body), true, { "x-slack-signature": "bad" }),
+        )
+      ).status,
+    ).toBe(401);
+    expect(mock.enqueue).not.toHaveBeenCalled();
+  });
+  it("adjustment submissions reject malformed/forged fields, trim reason and bind admin-channel feedback", async () => {
+    const input = (value: unknown) => ({ value: { value } });
+    const values = {
+      recipient: { value: { selected_user: "U2" } },
+      delta: input("-12"),
+      reason: input("  real correction  "),
+    };
+    const body = interaction({
+      type: "view_submission",
+      user: { id: "U9" },
+      view: {
+        id: "Vadjust",
+        callback_id: "pizza_adjust_save",
+        private_metadata: '{"user":"U1","recipient":"U3","channel":"CFAKE"}',
+        state: { values },
+      },
+    });
+    expect(
+      await (await interactions(request(form(body), true))).json(),
+    ).toEqual({ response_action: "clear" });
+    expect(mock.enqueue).toHaveBeenLastCalledWith(
+      "T1",
+      expect.any(String),
+      "adjustment",
+      {
+        user: "U9",
+        channel: "G2",
+        recipient: "U2",
+        delta: -12,
+        reason: "real correction",
+      },
+    );
+    mock.enqueue.mockClear();
+    for (const rawDelta of ["0", "1.2", "NaN", "-1000001", {}, "1e3"]) {
+      const invalid = {
+        ...body,
+        view: {
+          ...body.view,
+          state: { values: { ...values, delta: input(rawDelta) } },
+        },
+      };
+      expect(
+        (await (await interactions(request(form(invalid), true))).json()).errors
+          .delta,
+      ).toEqual(expect.any(String));
+    }
+    const invalid = {
+      ...body,
+      view: {
+        ...body.view,
+        state: {
+          values: {
+            ...values,
+            recipient: { value: { selected_user: "<!here>" } },
+            reason: input(" "),
+          },
+        },
+      },
+    };
+    expect(
+      (await (await interactions(request(form(invalid), true))).json()).errors,
+    ).toMatchObject({
+      recipient: expect.any(String),
+      reason: expect.any(String),
+    });
+    expect(
+      (await interactions(request(form({ ...body, user: { id: "U2" } }), true)))
+        .status,
+    ).toBe(403);
+    expect(
+      (await interactions(request(form({ ...body, team: { id: "T2" } }), true)))
+        .status,
+    ).toBe(403);
+    expect(mock.enqueue).not.toHaveBeenCalled();
   });
 });

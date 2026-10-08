@@ -2,6 +2,7 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 import { processJob, processDelivery, drain } from "./worker";
 import { PizzaStore, type Job, type Outbox, Refusal } from "./store";
 import { PizzaSlack, SlackTransient } from "./slack";
+import { DEFAULT_SETTINGS } from "./settings";
 import { config } from "./config";
 const c = config({
   PIZZA_ENABLED: "true",
@@ -16,6 +17,10 @@ const c = config({
 })!;
 const fixtures = () => {
   const storage = {
+    settings: vi.fn().mockResolvedValue({ ...DEFAULT_SETTINGS }),
+    saveSettings: vi.fn(),
+    adjustBalance: vi.fn(),
+    adminHistory: vi.fn().mockResolvedValue([]),
     retry: vi.fn(),
     finish: vi.fn(),
     award: vi.fn(),
@@ -25,9 +30,12 @@ const fixtures = () => {
     delivered: vi.fn(),
     claim: vi.fn().mockResolvedValue(null),
     maintenance: vi.fn(),
-    balance: vi
-      .fn()
-      .mockResolvedValue({ earned: 10, balance: 3, remaining: 4 }),
+    balance: vi.fn().mockResolvedValue({
+      earned: 10,
+      balance: 3,
+      remaining: 4,
+      dailyLimit: 5,
+    }),
     goal: vi.fn().mockResolvedValue(null),
     setGoal: vi.fn(),
     celebrationSnapshot: vi.fn().mockResolvedValue({
@@ -292,5 +300,113 @@ describe("recoverable worker", () => {
       );
     }
     expect(f.storage.leaderboard).not.toHaveBeenCalled();
+  });
+  it("settings/adjustment jobs freshly validate actor and recipient; stale/refused changes remain private in the admin channel", async () => {
+    const f = fixtures(),
+      settingsJob = {
+        ...j,
+        kind: "settings",
+        payload: { user: "U9", channel: "G2", version: 0, values: {} },
+      };
+    f.api.identity.mockResolvedValue({ id: "U9", team_id: "T1" });
+    f.storage.saveSettings.mockRejectedValue(
+      new Refusal("Settings changed; refresh"),
+    );
+    await processJob(f.s, f.slack, c, settingsJob);
+    expect(f.api.identity).toHaveBeenCalledWith("U9", true);
+    expect(f.storage.finish).toHaveBeenCalledWith(
+      settingsJob,
+      { text: expect.stringContaining("refresh") },
+      true,
+    );
+    f.api.identity.mockImplementation(async (id: string) => ({
+      id,
+      team_id: "T1",
+      ...(id === "U2" ? { is_bot: true } : {}),
+    }));
+    const adjustment = {
+      ...j,
+      kind: "adjustment",
+      payload: {
+        user: "U9",
+        channel: "G2",
+        recipient: "U2",
+        delta: 3,
+        reason: "Correction",
+      },
+    };
+    // Store independently rejects the freshly passed ineligible identity.
+    f.storage.adjustBalance.mockRejectedValue(
+      new Refusal("Choose eligible staff"),
+    );
+    await processJob(f.s, f.slack, c, adjustment);
+    expect(f.api.identity).toHaveBeenCalledWith("U2", true);
+    expect(f.storage.adjustBalance).toHaveBeenCalledWith(
+      adjustment,
+      { id: "U9", team_id: "T1" },
+      { id: "U2", team_id: "T1", is_bot: true },
+      c,
+    );
+    const unprivileged = {
+      ...adjustment,
+      payload: { ...adjustment.payload, user: "U3" },
+    };
+    f.storage.adjustBalance.mockClear();
+    await processJob(f.s, f.slack, c, unprivileged);
+    expect(f.storage.adjustBalance).not.toHaveBeenCalled();
+  });
+  it("commands reflect changed limit/presets and expose private paginated history and admin controls", async () => {
+    const f = fixtures();
+    f.storage.settings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      dailyLimit: 12,
+      smallCost: 20,
+    });
+    f.storage.balance.mockResolvedValue({
+      earned: 10,
+      balance: 3,
+      remaining: 8,
+      dailyLimit: 12,
+    });
+    await processJob(f.s, f.slack, c, j);
+    expect(JSON.stringify(f.storage.finish.mock.calls[0][1])).toContain(
+      "8/12 🍕",
+    );
+    expect(JSON.stringify(f.storage.finish.mock.calls[0][1])).toContain(
+      "Small 20 slices",
+    );
+    await processJob(f.s, f.slack, c, {
+      ...j,
+      payload: { user: "U2", text: "help" },
+    });
+    expect(f.storage.finish.mock.calls[1][1].text).toContain("12 to give");
+    f.api.identity.mockResolvedValue({ id: "U9", team_id: "T1" });
+    const admin = (text: string) => ({ ...j, payload: { user: "U9", text } });
+    await processJob(f.s, f.slack, c, admin("admin"));
+    expect(JSON.stringify(f.storage.finish.mock.calls[2][1])).toContain(
+      "pizza_settings",
+    );
+    expect(JSON.stringify(f.storage.finish.mock.calls[2][1])).toContain(
+      "pizza_adjust",
+    );
+    await processJob(f.s, f.slack, c, admin("admin settings"));
+    expect(JSON.stringify(f.storage.finish.mock.calls[3][1])).toContain(
+      "Daily giving limit: 12",
+    );
+    await processJob(f.s, f.slack, c, admin("admin history 2"));
+    expect(f.storage.adminHistory).toHaveBeenCalledWith("T1", 2);
+    expect(f.storage.finish.mock.calls[4][1]).toMatchObject({
+      text: "Private admin history",
+    });
+    f.api.identity.mockResolvedValue({ id: "U2", team_id: "T1" });
+    f.storage.adminHistory.mockClear();
+    const denied = { ...j, payload: { user: "U2", text: "admin history" } };
+    await processJob(f.s, f.slack, c, denied);
+    expect(f.storage.adminHistory).not.toHaveBeenCalled();
+    expect(f.storage.finish).toHaveBeenLastCalledWith(
+      denied,
+      { text: expect.any(String) },
+      true,
+    );
   });
 });

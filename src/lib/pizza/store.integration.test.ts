@@ -5,6 +5,7 @@ import { PizzaStore, Refusal, LostLease, type Job, type Outbox } from "./store";
 import { period, latestDue } from "./periods";
 import { scheduleCelebrations } from "./celebrations";
 import { type PizzaSlack } from "./slack";
+import { DEFAULT_SETTINGS, type PizzaSettings } from "./settings";
 import { config } from "./config";
 import { type AwardInput } from "./parser";
 import { type Identity } from "./policy";
@@ -83,6 +84,25 @@ async function redeem(u: string, id: string) {
     c,
   );
 }
+async function setSettings(
+  changes: Partial<PizzaSettings> = {},
+  revision?: number,
+) {
+  const settings = await s.settings(c.team),
+    { version, ...values } = settings;
+  const j = await job("settings", {
+    user: "U9",
+    version: revision ?? version,
+    values: { ...values, ...changes },
+  });
+  await s.saveSettings(j, user("U9"), c);
+  return j;
+}
+async function adjust(delta: number, recipient = "U2", reason = "Correction") {
+  const j = await job("adjustment", { user: "U9", recipient, delta, reason });
+  await s.adjustBalance(j, user("U9"), user(recipient), c);
+  return j;
+}
 describe.skipIf(!dsn)(
   "Pizza accounting with real PostgreSQL and concurrent connections",
   () => {
@@ -108,7 +128,7 @@ describe.skipIf(!dsn)(
     });
     beforeEach(async () => {
       await pool.query(
-        "TRUNCATE pizza_celebrations,pizza_reward_goals,pizza_users,pizza_inbox,pizza_daily_usage,pizza_awards,pizza_award_recipients,pizza_rewards,pizza_redemption_intents,pizza_redemptions,pizza_ledger,pizza_outbox RESTART IDENTITY CASCADE",
+        "TRUNCATE pizza_settings,pizza_settings_changes,pizza_balance_adjustments,pizza_celebrations,pizza_reward_goals,pizza_users,pizza_inbox,pizza_daily_usage,pizza_awards,pizza_award_recipients,pizza_rewards,pizza_redemption_intents,pizza_redemptions,pizza_ledger,pizza_outbox RESTART IDENTITY CASCADE",
       );
     });
     afterAll(async () => {
@@ -956,6 +976,600 @@ describe.skipIf(!dsn)(
       } finally {
         await bare.end();
       }
+    });
+    it("dynamic allowance supports more than five; lowering clamps without refund and raising restores only unused allowance", async () => {
+      await setSettings({ dailyLimit: 10 });
+      const now = String(Math.floor(Date.now() / 1000)) + ".000001";
+      await give({ ...award("U1", ["U2"], 7), ts: now });
+      expect(await s.balance(c.team, "U1")).toMatchObject({
+        remaining: 3,
+        dailyLimit: 10,
+      });
+      await setSettings({ dailyLimit: 3 });
+      expect(await s.balance(c.team, "U1")).toMatchObject({
+        remaining: 0,
+        dailyLimit: 3,
+      });
+      expect(
+        await give({
+          ...award("U1", ["U2"], 1),
+          ts: now.replace("000001", "000002"),
+        }),
+      ).toBe("rejected");
+      expect(
+        (
+          await pool.query(
+            "SELECT used,daily_limit FROM pizza_daily_usage WHERE giver_id='U1'",
+          )
+        ).rows[0],
+      ).toEqual({ used: 7, daily_limit: 3 });
+      await setSettings({ dailyLimit: 9 });
+      expect(await s.balance(c.team, "U1")).toMatchObject({ remaining: 2 });
+      expect(
+        await give({
+          ...award("U1", ["U2"], 2),
+          ts: now.replace("000001", "000003"),
+        }),
+      ).toBe("accepted");
+      expect((await s.balance(c.team, "U2")).earned).toBe(9);
+    });
+    it("zero pauses recognition only; settings and other operations remain available", async () => {
+      await setSettings({ dailyLimit: 0 });
+      expect(await give()).toBe("rejected");
+      expect(
+        (await pool.query("SELECT rejection FROM pizza_awards")).rows[0]
+          .rejection,
+      ).toContain("Giving is paused");
+      expect(await s.balance(c.team, "U1")).toMatchObject({
+        remaining: 0,
+        dailyLimit: 0,
+      });
+      await adjust(6);
+      const r = await reward(2),
+        intent = await s.intent(c.team, "U2", r.id);
+      await redeem("U2", intent.id);
+      await setSettings({ dailyLimit: 5 });
+      expect(await give()).toBe("accepted");
+    });
+    it("settings optimistic revisions serialize concurrent saves, reject stale/replay and no-op creates no history", async () => {
+      const { version, ...values } = DEFAULT_SETTINGS;
+      const one = await job("settings", {
+          user: "U9",
+          version,
+          values: { ...values, dailyLimit: 8 },
+        }),
+        two = await job("settings", {
+          user: "U9",
+          version,
+          values: { ...values, dailyLimit: 9 },
+        });
+      const results = await Promise.allSettled([
+        s.saveSettings(one, user("U9"), c),
+        s.saveSettings(two, user("U9"), c),
+      ]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejected = results.find(
+        (r) => r.status === "rejected",
+      ) as PromiseRejectedResult;
+      expect(rejected.reason).toBeInstanceOf(Refusal);
+      expect(rejected.reason.message).toMatch(/Settings changed/);
+      const success = results[0].status === "fulfilled" ? one : two;
+      await expect(
+        s.saveSettings(success, user("U9"), c),
+      ).rejects.toBeInstanceOf(LostLease);
+      const current = await s.settings(c.team);
+      await setSettings();
+      expect(await s.settings(c.team)).toEqual(current);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_settings_changes"))
+          .rows[0].n,
+      ).toBe(1);
+    });
+    it("settings reject spoofed actor, nonadmin, guest, wrong team and invalid values, and remain team isolated", async () => {
+      const { version, ...values } = DEFAULT_SETTINGS;
+      for (const actor of [
+        user("U2"),
+        user("U9", { deleted: true }),
+        user("U9", { team_id: "T2" }),
+      ]) {
+        const j = await job("settings", {
+          user: "U9",
+          version,
+          values: { ...values, dailyLimit: 8 },
+        });
+        await expect(s.saveSettings(j, actor, c)).rejects.toBeInstanceOf(
+          Refusal,
+        );
+      }
+      const wrong = await job("settings", { user: "U9", version, values });
+      await expect(
+        s.saveSettings({ ...wrong, team_id: "T2" }, user("U9"), c),
+      ).rejects.toBeInstanceOf(Refusal);
+      for (const change of [
+        { dailyLimit: -1 },
+        { dailyLimit: 1001 },
+        { smallCost: 0 },
+        { largeCost: 1000001 },
+        { monthlyEnabled: "true" },
+        { token: "secret" },
+      ]) {
+        const j = await job("settings", {
+          user: "U9",
+          version,
+          values: { ...values, ...change },
+        });
+        await expect(s.saveSettings(j, user("U9"), c)).rejects.toBeInstanceOf(
+          Refusal,
+        );
+      }
+      await setSettings({
+        dailyLimit: 8,
+        smallCost: 14,
+        mediumCost: 2,
+        largeCost: 1,
+      });
+      expect(await s.settings("T2")).toEqual(DEFAULT_SETTINGS);
+      expect((await s.settings(c.team)).dailyLimit).toBe(8);
+    });
+    it("award waits for settings save lock then uses newly committed limit, without resetting original day usage", async () => {
+      const client = await pool.connect();
+      await client.query("BEGIN");
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        [`${c.team}:settings`],
+      );
+      await client.query(
+        "INSERT INTO pizza_settings(team_id,daily_limit) VALUES('T1',9)",
+      );
+      const a = award("U1", ["U2"], 8),
+        j = await job("award", a);
+      let done = false;
+      const waiting = s.award(j, a, [user("U1"), user("U2")], c).then((r) => {
+        done = true;
+        return r;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(done).toBe(false);
+      await client.query("COMMIT");
+      client.release();
+      expect(await waiting).toBe("accepted");
+      expect(
+        (await pool.query("SELECT used,daily_limit FROM pizza_daily_usage"))
+          .rows[0],
+      ).toEqual({ used: 8, daily_limit: 9 });
+    });
+    it("new presets and report switches never reprice existing rewards/intents or stop committed reports", async () => {
+      await adjust(20);
+      const r = await reward(6),
+        i = await s.intent(c.team, "U2", r.id);
+      const week = latestDue("week", new Date("2026-10-09T12:00:00Z")),
+        month = latestDue("month", new Date("2026-11-01T06:00:00Z"));
+      expect(
+        await s.queueCelebration(c.team, week, 0, { text: "Committed" }, "C1"),
+      ).toBe(true);
+      await setSettings({
+        smallCost: 9,
+        mediumCost: 3,
+        largeCost: 20,
+        weeklyEnabled: false,
+        monthlyEnabled: false,
+      });
+      expect((await s.reward(c.team, r.id))!.cost).toBe(6);
+      expect(
+        (
+          await pool.query(
+            "SELECT confirmed_cost FROM pizza_redemption_intents WHERE id=$1",
+            [i.id],
+          )
+        ).rows[0].confirmed_cost,
+      ).toBe(6);
+      expect(
+        await s.queueCelebration(
+          c.team,
+          month,
+          0,
+          { text: "Do not queue" },
+          "C1",
+        ),
+      ).toBe(false);
+      expect(
+        (
+          await pool.query(
+            "SELECT status FROM pizza_outbox WHERE notification_key LIKE 'celebration:%'",
+          )
+        ).rows[0].status,
+      ).toBe("pending");
+      await setSettings({ monthlyEnabled: true });
+      expect(
+        await s.queueCelebration(
+          c.team,
+          month,
+          0,
+          { text: "Latest month" },
+          "C1",
+        ),
+      ).toBe(true);
+    });
+    it("report final transaction sees a switch disabled during permalink lookup", async () => {
+      const now = new Date("2026-10-09T12:00:00Z"),
+        p = latestDue("week", now);
+      await give({
+        ...award(),
+        ts: String(p.start!.getTime() / 1000 + 1) + ".000001",
+      });
+      let calls = 0;
+      const api = {
+        permalink: async () => {
+          calls++;
+          await setSettings({ weeklyEnabled: false });
+          return "https://gr.slack.com/archives/C1/p1";
+        },
+      } as unknown as PizzaSlack;
+      expect(
+        await scheduleCelebrations(
+          s,
+          api,
+          {
+            ...c,
+            celebrationsEnabled: true,
+            celebrationsStartAt: new Date("2026-10-08T00:00:00Z"),
+          },
+          now,
+        ),
+      ).toBe(0);
+      expect(calls).toBe(1);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_celebrations"))
+          .rows[0].n,
+      ).toBe(0);
+    });
+    it("balance corrections before first award credit/debit once without recognition or daily allowance changes", async () => {
+      const first = await adjust(
+        12,
+        "U5",
+        "  Onboarding correction <@U999> *literal*  ",
+      );
+      await adjust(-5, "U5");
+      expect(await s.balance(c.team, "U5")).toMatchObject({
+        earned: 0,
+        balance: 7,
+        remaining: 5,
+      });
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_awards")).rows[0]
+          .n,
+      ).toBe(0);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_daily_usage"))
+          .rows[0].n,
+      ).toBe(0);
+      expect(await s.leaderboard(c.team, period("all"))).toEqual([]);
+      expect(
+        (
+          await pool.query(
+            "SELECT kind,earned_delta,balance_delta FROM pizza_ledger ORDER BY id",
+          )
+        ).rows,
+      ).toEqual([
+        { kind: "adjustment", earned_delta: 0, balance_delta: 12 },
+        { kind: "adjustment", earned_delta: 0, balance_delta: -5 },
+      ]);
+      const audit = (
+        await pool.query(
+          "SELECT * FROM pizza_balance_adjustments WHERE job_id=$1",
+          [first.id],
+        )
+      ).rows[0];
+      expect(audit).toMatchObject({
+        actor: "U9",
+        recipient: "U5",
+        delta: 12,
+        before_balance: 0,
+        after_balance: 12,
+        reason: "Onboarding correction <@U999> *literal*",
+      });
+      const notifications = (
+        await pool.query(
+          "SELECT target,payload FROM pizza_outbox WHERE notification_key LIKE 'adjustment-%' AND notification_key LIKE $1",
+          [`%${first.id}`],
+        )
+      ).rows;
+      expect(notifications).toHaveLength(2);
+      expect(notifications.every((n) => n.target.kind === "ephemeral")).toBe(
+        true,
+      );
+      expect(JSON.stringify(notifications[0].payload.blocks)).toContain(
+        '"type":"plain_text"',
+      );
+      expect(
+        await s.adjustBalance(first, user("U9"), user("U5"), c).catch((e) => e),
+      ).toBeInstanceOf(LostLease);
+      expect((await s.balance(c.team, "U5")).balance).toBe(7);
+    });
+    it("adjustments reject insufficient funds/overflow and duplicate concurrent lease cannot debit twice", async () => {
+      await adjust(3);
+      await expect(adjust(-4)).rejects.toBeInstanceOf(Refusal);
+      await pool.query(
+        "UPDATE pizza_users SET balance=2147483647 WHERE team_id='T1' AND user_id='U2'",
+      );
+      await expect(adjust(1)).rejects.toBeInstanceOf(Refusal);
+      await pool.query(
+        "UPDATE pizza_users SET balance=3 WHERE team_id='T1' AND user_id='U2'",
+      );
+      const j = await job("adjustment", {
+        user: "U9",
+        recipient: "U2",
+        delta: -2,
+        reason: "Single debit",
+      });
+      const results = await Promise.allSettled([
+        s.adjustBalance(j, user("U9"), user("U2"), c),
+        s.adjustBalance(j, user("U9"), user("U2"), c),
+      ]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect((await s.balance(c.team, "U2")).balance).toBe(1);
+      expect(
+        (
+          await pool.query(
+            "SELECT count(*)::int n FROM pizza_balance_adjustments",
+          )
+        ).rows[0].n,
+      ).toBe(2);
+    });
+    it("adjustment authority and freshly passed recipient identity reject spoof, foreign, bots, guests, deleted and allowlist exclusions", async () => {
+      const j = await job("adjustment", {
+        user: "U9",
+        recipient: "U2",
+        delta: 5,
+        reason: "Correction",
+      });
+      for (const target of [
+        user("U3"),
+        user("U2", { is_bot: true }),
+        user("U2", { is_restricted: true }),
+        user("U2", { deleted: true }),
+        user("U2", { team_id: "T2" }),
+      ])
+        await expect(
+          s.adjustBalance(j, user("U9"), target, c),
+        ).rejects.toBeInstanceOf(Refusal);
+      for (const actor of [
+        user("U2"),
+        user("U9", { is_bot: true }),
+        user("U9", { team_id: "T2" }),
+      ])
+        await expect(
+          s.adjustBalance(j, actor, user("U2"), c),
+        ).rejects.toBeInstanceOf(Refusal);
+      await expect(
+        s.adjustBalance({ ...j, team_id: "T2" }, user("U9"), user("U2"), c),
+      ).rejects.toBeInstanceOf(Refusal);
+      await expect(
+        s.adjustBalance(j, user("U9"), user("U2"), {
+          ...c,
+          participants: ["U9"],
+        }),
+      ).rejects.toBeInstanceOf(Refusal);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_users")).rows[0].n,
+      ).toBe(0);
+    });
+    it("forced notification failure rolls back correction account, ledger, audit and completion atomically", async () => {
+      await pool.query(
+        "ALTER TABLE pizza_outbox ADD CONSTRAINT fail_adjustment_notification CHECK(notification_key NOT LIKE 'adjustment-recipient:%')",
+      );
+      const j = await job("adjustment", {
+        user: "U9",
+        recipient: "U5",
+        delta: 8,
+        reason: "Atomic correction",
+      });
+      await expect(
+        s.adjustBalance(j, user("U9"), user("U5"), c),
+      ).rejects.toThrow();
+      for (const table of [
+        "pizza_users",
+        "pizza_ledger",
+        "pizza_balance_adjustments",
+        "pizza_outbox",
+      ])
+        expect(
+          (await pool.query(`SELECT count(*)::int n FROM ${table}`)).rows[0].n,
+        ).toBe(0);
+      expect(
+        (await pool.query("SELECT status FROM pizza_inbox WHERE id=$1", [j.id]))
+          .rows[0].status,
+      ).toBe("running");
+      await pool.query(
+        "ALTER TABLE pizza_outbox DROP CONSTRAINT fail_adjustment_notification",
+      );
+      await s.adjustBalance(j, user("U9"), user("U5"), c);
+      expect((await s.balance(c.team, "U5")).balance).toBe(8);
+    });
+    it("concurrent correction with redemption and refund preserves earned, total balance and stock", async () => {
+      await seed("U2", 10);
+      const r = await reward(3, 1),
+        i = await s.intent(c.team, "U2", r.id);
+      const aj = await job("adjustment", {
+          user: "U9",
+          recipient: "U2",
+          delta: -2,
+          reason: "Reconcile",
+        }),
+        rj = await job("redeem", { intent: i.id, user: "U2", channel: "C1" });
+      const [, rid] = await Promise.all([
+        s.adjustBalance(aj, user("U9"), user("U2"), c),
+        s.redeem(rj, user("U2"), c),
+      ]);
+      expect((await s.balance(c.team, "U2")).balance).toBe(5);
+      const bj = await job("adjustment", {
+          user: "U9",
+          recipient: "U2",
+          delta: 4,
+          reason: "Reconcile again",
+        }),
+        cancel = await job("admin_action", {
+          user: "U9",
+          request: rid,
+          action: "cancel",
+        });
+      await Promise.all([
+        s.adjustBalance(bj, user("U9"), user("U2"), c),
+        s.adminAction(cancel, user("U9"), c),
+      ]);
+      expect(await s.balance(c.team, "U2")).toMatchObject({
+        earned: 10,
+        balance: 12,
+      });
+      expect((await s.reward(c.team, r.id))!.stock).toBe(1);
+      expect(
+        (
+          await pool.query(
+            "SELECT sum(balance_delta)::int balance,sum(earned_delta)::int earned FROM pizza_ledger WHERE user_id='U2'",
+          )
+        ).rows[0],
+      ).toEqual({ balance: 12, earned: 10 });
+    });
+    it("history persists after inbox retention, paginates ten and isolates teams; new ledger retains append-only and delta guards", async () => {
+      for (let n = 0; n < 12; n++) await adjust(1, "U2", `Reason ${n}`);
+      await pool.query(
+        "UPDATE pizza_inbox SET completed_at=now()-interval '31 days'",
+      );
+      await s.maintenance(c.team);
+      expect(
+        (await pool.query("SELECT payload FROM pizza_inbox")).rows.every(
+          (r) => r.payload === null,
+        ),
+      ).toBe(true);
+      expect(await s.adminHistory(c.team, 0)).toHaveLength(10);
+      expect(await s.adminHistory(c.team, 1)).toHaveLength(2);
+      expect(await s.adminHistory("T2", 0)).toEqual([]);
+      expect((await s.adminHistory(c.team))[0]).toMatchObject({
+        actor: "U9",
+        recipient: "U2",
+        reason: expect.any(String),
+      });
+      await expect(
+        pool.query(
+          "UPDATE pizza_ledger SET balance_delta=2 WHERE kind='adjustment'",
+        ),
+      ).rejects.toThrow(/append-only/);
+      await expect(
+        pool.query("DELETE FROM pizza_ledger WHERE kind='adjustment'"),
+      ).rejects.toThrow(/append-only/);
+      await expect(
+        pool.query(
+          "INSERT INTO pizza_ledger(team_id,user_id,kind,reference_id,actor,earned_delta,balance_delta,operation_key) VALUES('T1','U2','adjustment',gen_random_uuid(),'U9',1,1,'invalid-adjust')",
+        ),
+      ).rejects.toThrow();
+      await expect(
+        pool.query(
+          "INSERT INTO pizza_ledger(team_id,user_id,kind,reference_id,actor,earned_delta,balance_delta,operation_key) VALUES('T1','U2','award',gen_random_uuid(),'U9',0,1,'invalid-award')",
+        ),
+      ).rejects.toThrow();
+    });
+    it("an actual concurrent settings save waits for an award's shared lock and applies only afterward", async () => {
+      let unlock!: () => void, started!: () => void;
+      const release = new Promise<void>((r) => {
+          unlock = r;
+        }),
+        entered = new Promise<void>((r) => {
+          started = r;
+        });
+      class HeldAwardStore extends PizzaStore {
+        override async settings(...args: Parameters<PizzaStore["settings"]>) {
+          const value = await super.settings(...args);
+          if (args[2] === "shared") {
+            started();
+            await release;
+          }
+          return value;
+        }
+      }
+      const a = award("U1", ["U2"], 5),
+        aj = await job("award", a),
+        { version, ...values } = DEFAULT_SETTINGS;
+      const sj = await job("settings", {
+        user: "U9",
+        version,
+        values: { ...values, dailyLimit: 2 },
+      });
+      const awardWork = new HeldAwardStore(pool).award(
+        aj,
+        a,
+        [user("U1"), user("U2")],
+        c,
+      );
+      await entered;
+      let saved = false;
+      const saveWork = s.saveSettings(sj, user("U9"), c).then(() => {
+        saved = true;
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      expect(saved).toBe(false);
+      unlock();
+      expect(await awardWork).toBe("accepted");
+      await saveWork;
+      expect((await s.settings(c.team)).dailyLimit).toBe(2);
+      expect(
+        (await pool.query("SELECT used,daily_limit FROM pizza_daily_usage"))
+          .rows[0],
+      ).toEqual({ used: 5, daily_limit: 5 });
+      expect((await s.balance(c.team, "U2")).earned).toBe(5);
+    });
+    it("settings audit/notification failure rolls back every setting change and can recover", async () => {
+      const { version, ...values } = DEFAULT_SETTINGS,
+        j = await job("settings", {
+          user: "U9",
+          version,
+          values: { ...values, dailyLimit: 9 },
+        });
+      await pool.query(
+        "ALTER TABLE pizza_outbox ADD CONSTRAINT fail_settings_notification CHECK(notification_key NOT LIKE 'settings:%')",
+      );
+      await expect(s.saveSettings(j, user("U9"), c)).rejects.toThrow();
+      expect(await s.settings(c.team)).toEqual(DEFAULT_SETTINGS);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_settings_changes"))
+          .rows[0].n,
+      ).toBe(0);
+      await pool.query(
+        "ALTER TABLE pizza_outbox DROP CONSTRAINT fail_settings_notification",
+      );
+      await s.saveSettings(j, user("U9"), c);
+      expect((await s.settings(c.team)).dailyLimit).toBe(9);
+    });
+    it("concurrent debit and redemption cannot overspend or lose slices", async () => {
+      await adjust(8);
+      const r = await reward(6),
+        i = await s.intent(c.team, "U2", r.id);
+      const aj = await job("adjustment", {
+          user: "U9",
+          recipient: "U2",
+          delta: -6,
+          reason: "Concurrent debit",
+        }),
+        rj = await job("redeem", { user: "U2", intent: i.id });
+      const results = await Promise.allSettled([
+        s.adjustBalance(aj, user("U9"), user("U2"), c),
+        s.redeem(rj, user("U2"), c),
+      ]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(
+        (results.find((r) => r.status === "rejected") as PromiseRejectedResult)
+          .reason,
+      ).toBeInstanceOf(Refusal);
+      expect(await s.balance(c.team, "U2")).toMatchObject({
+        earned: 0,
+        balance: 2,
+      });
+      expect(
+        (
+          await pool.query(
+            "SELECT sum(balance_delta)::int balance FROM pizza_ledger",
+          )
+        ).rows[0].balance,
+      ).toBe(2);
     });
   },
 );

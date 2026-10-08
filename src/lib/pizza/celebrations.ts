@@ -130,8 +130,11 @@ export async function scheduleCelebrations(
   now = new Date(),
 ): Promise<number> {
   if (!c.enabled || !c.celebrationsEnabled || !c.celebrationsStartAt) return 0;
+  const settings = await s.settings(c.team);
   let queued = 0;
   for (const kind of ["week", "month"] as const) {
+    if (!(kind === "week" ? settings.weeklyEnabled : settings.monthlyEnabled))
+      continue;
     const p = latestDue(kind, now);
     if (
       p.due!.getTime() < c.celebrationsStartAt.getTime() ||

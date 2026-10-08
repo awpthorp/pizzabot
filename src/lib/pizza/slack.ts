@@ -26,9 +26,9 @@ export class PizzaSlack {
   invalidate(id: string) {
     this.users.delete(id);
   }
-  async identity(id: string): Promise<Identity> {
+  async identity(id: string, fresh = false): Promise<Identity> {
     const cached = this.users.get(id);
-    if (cached && cached.expires > Date.now()) return cached.user;
+    if (!fresh && cached && cached.expires > Date.now()) return cached.user;
     let result;
     try {
       result = await this.client.users.info({ user: id });

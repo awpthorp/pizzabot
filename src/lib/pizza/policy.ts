@@ -39,6 +39,7 @@ export function rejection(
   used: number,
   identities: Identity[],
   c: PizzaConfig,
+  dailyLimit = DAILY_LIMIT,
 ): string | null {
   if (recipients.includes(giver)) return "You cannot give pizzas to yourself.";
   if (
@@ -46,7 +47,9 @@ export function rejection(
     identities.length !== new Set([giver, ...recipients]).size
   )
     return "Everyone must be an eligible workspace member.";
-  if (total > DAILY_LIMIT - used)
-    return `That needs ${total} pizzas. You have ${DAILY_LIMIT - used} left for this message's Dubai day.`;
+  if (dailyLimit === 0)
+    return "Giving is paused by an admin (daily limit is 0).";
+  if (total > Math.max(0, dailyLimit - used))
+    return `That needs ${total} pizzas. You have ${Math.max(0, dailyLimit - used)} left for this message's Dubai day.`;
   return null;
 }

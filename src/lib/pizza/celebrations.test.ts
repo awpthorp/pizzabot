@@ -6,6 +6,7 @@ import {
   scheduleCelebrations,
   type CelebrationSnapshot,
 } from "./celebrations";
+import { DEFAULT_SETTINGS } from "./settings";
 import { period } from "./periods";
 import { config } from "./config";
 import type { PizzaStore } from "./store";
@@ -133,6 +134,7 @@ describe("celebrations without fabrication", () => {
   });
   it("skips pre-activation due dates and selects at most the latest due week/month after an outage", async () => {
     const s = {
+      settings: vi.fn().mockResolvedValue({ ...DEFAULT_SETTINGS }),
       celebrationReady: vi.fn().mockResolvedValue(true),
       celebrationSnapshot: vi.fn().mockResolvedValue(empty),
       queueCelebration: vi.fn().mockResolvedValue(true),
@@ -163,5 +165,61 @@ describe("celebrations without fabrication", () => {
       "week",
       "month",
     ]);
+  });
+  it("per-team weekly/monthly switches skip only their report without resetting activation or latest recovery", async () => {
+    const s = {
+      settings: vi.fn(),
+      celebrationReady: vi.fn().mockResolvedValue(true),
+      celebrationSnapshot: vi.fn().mockResolvedValue(empty),
+      queueCelebration: vi.fn().mockResolvedValue(true),
+    };
+    const cfg = {
+      ...c,
+      celebrationsEnabled: true,
+      celebrationsStartAt: new Date("2026-10-08T00:00:00Z"),
+    };
+    s.settings.mockResolvedValue({ ...DEFAULT_SETTINGS, weeklyEnabled: false });
+    expect(
+      await scheduleCelebrations(
+        s as unknown as PizzaStore,
+        {} as PizzaSlack,
+        cfg,
+        new Date("2026-12-15T10:00:00Z"),
+      ),
+    ).toBe(1);
+    expect(s.queueCelebration.mock.calls.map((call) => call[1].kind)).toEqual([
+      "month",
+    ]);
+    s.queueCelebration.mockClear();
+    s.settings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      monthlyEnabled: false,
+    });
+    expect(
+      await scheduleCelebrations(
+        s as unknown as PizzaStore,
+        {} as PizzaSlack,
+        cfg,
+        new Date("2026-12-15T10:00:00Z"),
+      ),
+    ).toBe(1);
+    expect(s.queueCelebration.mock.calls.map((call) => call[1].kind)).toEqual([
+      "week",
+    ]);
+    s.queueCelebration.mockClear();
+    s.settings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      weeklyEnabled: false,
+      monthlyEnabled: false,
+    });
+    expect(
+      await scheduleCelebrations(
+        s as unknown as PizzaStore,
+        {} as PizzaSlack,
+        cfg,
+        new Date("2026-12-15T10:00:00Z"),
+      ),
+    ).toBe(0);
+    expect(s.queueCelebration).not.toHaveBeenCalled();
   });
 });

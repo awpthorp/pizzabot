@@ -9,8 +9,9 @@ AI model dependency.
 
 ## Recognition policy
 
-Five pizzas to give per original message's Asia/Dubai calendar day, including
-weekends. Receiving does not replenish giving. Lifetime earned and available
+The default is five pizzas to give per original message's Asia/Dubai calendar
+day, including weekends. Admins can change the daily limit from Slack; the original
+message date still determines which day's allowance is consumed. Receiving does not replenish giving. Lifetime earned and available
 balance are distinct; one received 🍕 earns one slice. Redemption spends available
 slices without changing earned leaderboard scores. Unused giving allowance expires at midnight; no reset job.
 
@@ -32,7 +33,8 @@ Slack ID order within ties. Weeks run Friday 16:00 to the next Friday 16:00 in
 Asia/Dubai; months use the Dubai calendar. Every bounded leaderboard prints its
 exact dates, including the exclusive end.
 
-`/pizza admin` shows reward controls, pending requests, and ambiguous notifications.
+`/pizza admin` shows Manage settings, Adjust balance, reward controls, pending
+requests, and ambiguous notifications.
 `/pizza admin rewards [page]`, `requests [page]`, and `deliveries [page]` show
 additional records; pages start at 0. `/pizza admin preview [week|month]` privately
 shows the current period to a configured eligible admin, even before celebrations
@@ -58,6 +60,49 @@ eligibility, stock and confirmed price, then debits once and creates a pending
 request. Price changes require renewed confirmation. Alex and Georgia receive
 admin controls; admins fulfil or cancel/refund pending requests. A fulfilled
 request cannot be cancelled. Request names/prices retain their original snapshot.
+
+## Admin flexibility
+
+Alex and Georgia can use `/pizza admin settings` or Manage settings to set the
+daily giving limit (0–1000), new Small/Medium/Large preset costs (1–1000000, in
+any order), and weekly/monthly celebration switches. Defaults stay 5 per day and
+6/8/12 slices, with both report switches on. Preset changes update new modal
+defaults and guidance; they never reprice existing prizes or confirmations.
+
+Limits affect awards processed after the settings transaction commits. A shared
+settings lock serializes awarding against a save. Already consumed allowance
+stays consumed: lowering below usage clamps remaining to zero, raising restores
+only the unused difference, and zero pauses new giving while reward/admin controls
+remain available. Settings modals carry an optimistic revision so a stale save
+asks the admin to refresh instead of overwriting someone else's change. A no-op
+save changes no values, revision or history.
+
+Adjust balance opens a staff picker, signed nonzero slice amount (between
+-1000000 and +1000000), and required reason up to 500 characters. The worker
+freshly checks both admin and recipient eligibility, including staff allowlists.
+Corrections change available balance only: earned recognition, leaderboards and
+giving allowance stay unchanged. A recipient can receive a correction before
+their first award. Negative resulting balances and integer overflow are refused.
+The modal's Apply button submits the correction; the admin and recipient receive
+private receipts showing who changed what, before/after balances and the reason.
+Private refusal feedback from these modals appears in the admin channel.
+
+Account locks serialize corrections with redemption/refunds. The job-derived
+adjustment ID deduplicates replays, and the balance change, immutable balance-only
+ledger entry, audit, notifications and job completion commit together. Never edit
+ledger rows or create a second correction to recover an uncertain notification.
+`/pizza admin history [page]` privately shows the latest ten settings changes and
+corrections per page, with literal reasons and trusted staff mentions. History
+retains actor/time/old/new values and before/after balances after inbox retention;
+it contains no response URLs or credentials. Credentials, channel IDs, admin
+roles, staff eligibility, timezone and report timing remain server-controlled.
+
+Report switches affect new weekly/monthly reports and are checked again inside
+the final queue transaction. Disabling during link lookup prevents a new report;
+already queued messages remain deliverable. Re-enabling keeps the original
+activation guard and latest-only recovery, with no historical flood. The separate
+server enable/activation gates still apply. Private current-period previews remain
+available to eligible admins regardless of the individual report switches.
 
 ## Local development and checks
 
@@ -233,6 +278,9 @@ the scheme's lifetime. Logs use only safe error codes.
 - Configure a test reward as an admin. Open/cancel then redeem; check private
   receipt, admin request, original name/cost, fulfilment and one-time refund.
 - Test a non-admin action, stale price, duplicate submission and stock-one race.
+- Open settings and save unchanged; open/cancel Adjust balance and inspect history.
+  Policy/correction mutation and race checks belong in disposable databases; do
+  not change live defaults, balances or prizes just to test the controls.
 - Stop/restart the worker with pending work and confirm the independent cron
   drains it. Confirm `/brain` and an existing Assistant button still work.
 - Pin the recognition policy in `#pizza`; introduce admin controls in the private

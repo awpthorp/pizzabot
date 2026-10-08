@@ -9,7 +9,12 @@ import {
 import { store, Refusal } from "@/lib/pizza/store";
 import { slack } from "@/lib/pizza/slack";
 import { eligible } from "@/lib/pizza/policy";
-import { confirmationModal, rewardModal } from "@/lib/pizza/blocks";
+import {
+  confirmationModal,
+  rewardModal,
+  settingsModal,
+  adjustmentModal,
+} from "@/lib/pizza/blocks";
 import { isTier } from "@/lib/pizza/rewards";
 import { drain } from "@/lib/pizza/worker";
 export const runtime = "nodejs";
@@ -48,7 +53,13 @@ export async function POST(request: Request) {
         )
         .digest("hex")}`,
       kind,
-      { ...payload, user, channel },
+      {
+        ...payload,
+        user,
+        channel: ["settings", "adjustment"].includes(kind)
+          ? c.adminChannel
+          : channel,
+      },
     );
     after(async () => {
       try {
@@ -71,6 +82,8 @@ export async function POST(request: Request) {
           "pizza_add_medium",
           "pizza_add_large",
           "pizza_edit",
+          "pizza_settings",
+          "pizza_adjust",
         ].includes(action.action_id)
       ) {
         if (typeof body.trigger_id !== "string" || !body.trigger_id)
@@ -93,10 +106,27 @@ export async function POST(request: Request) {
         } else {
           if (!c.admins.includes(user))
             return new Response("Admins only", { status: 403 });
-          const reward =
+          if (
+            action.action_id === "pizza_settings" ||
+            action.action_id === "pizza_adjust"
+          ) {
+            const view =
+              action.action_id === "pizza_settings"
+                ? settingsModal(await s.settings(c.team))
+                : adjustmentModal();
+            if (Date.now() - started > 1800)
+              throw new Refusal(
+                "Please click again; admin controls took too long to open.",
+              );
+            await api.modal(body.trigger_id, view);
+            return new Response(null, { status: 200 });
+          }
+          const [reward, settings] = await Promise.all([
             action.action_id === "pizza_edit" && uuid(action.value)
-              ? await s.reward(c.team, action.value)
-              : null;
+              ? s.reward(c.team, action.value)
+              : Promise.resolve(null),
+            s.settings(c.team),
+          ]);
           if (action.action_id === "pizza_edit" && !reward)
             throw new Refusal("Unknown reward.");
           if (Date.now() - started > 1800)
@@ -109,6 +139,7 @@ export async function POST(request: Request) {
             rewardModal(
               reward ?? undefined,
               isTier(preset) ? preset : undefined,
+              settings,
             ),
           );
         }
@@ -167,6 +198,86 @@ export async function POST(request: Request) {
         )
           return new Response("Invalid confirmation", { status: 403 });
         await enqueue("redeem", { intent: view.private_metadata });
+        return Response.json({ response_action: "clear" });
+      }
+      if (
+        ["pizza_settings_save", "pizza_adjust_save"].includes(view.callback_id)
+      ) {
+        if (!c.admins.includes(user))
+          return new Response("Admins only", { status: 403 });
+        const values = view.state?.values;
+        const get = (id: string) => values?.[id]?.value?.value;
+        const errors: Record<string, string> = {};
+        if (view.callback_id === "pizza_settings_save") {
+          if (
+            typeof view.private_metadata !== "string" ||
+            !/^\d{1,10}$/.test(view.private_metadata) ||
+            Number(view.private_metadata) > 2147483647
+          )
+            return new Response("Invalid settings revision", { status: 400 });
+          const numeric: Record<string, number> = {};
+          for (const key of [
+            "dailyLimit",
+            "smallCost",
+            "mediumCost",
+            "largeCost",
+          ]) {
+            const raw = get(key),
+              max = key === "dailyLimit" ? 1000 : 1000000,
+              min = key === "dailyLimit" ? 0 : 1;
+            if (
+              typeof raw !== "string" ||
+              !/^\d{1,7}$/.test(raw) ||
+              Number(raw) < min ||
+              Number(raw) > max
+            )
+              errors[key] = `Enter an integer from ${min} to ${max}.`;
+            numeric[key] = Number(raw);
+          }
+          const toggles: Record<string, boolean> = {};
+          for (const key of ["weeklyEnabled", "monthlyEnabled"]) {
+            const selected = values?.[key]?.value?.selected_option?.value;
+            if (selected !== "on" && selected !== "off")
+              errors[key] = "Choose On or Off.";
+            toggles[key] = selected === "on";
+          }
+          if (Object.keys(errors).length)
+            return Response.json({ response_action: "errors", errors });
+          await enqueue("settings", {
+            version: Number(view.private_metadata),
+            values: { ...numeric, ...toggles },
+          });
+        } else {
+          const recipient = values?.recipient?.value?.selected_user,
+            rawDelta = get("delta"),
+            reason = get("reason");
+          if (
+            typeof recipient !== "string" ||
+            !/^[UW][A-Z0-9]+$/.test(recipient)
+          )
+            errors.recipient = "Choose an eligible staff member.";
+          if (
+            typeof rawDelta !== "string" ||
+            !/^[+-]?\d{1,7}$/.test(rawDelta) ||
+            Number(rawDelta) === 0 ||
+            Math.abs(Number(rawDelta)) > 1000000
+          )
+            errors.delta =
+              "Enter a nonzero signed integer from -1000000 to +1000000.";
+          if (
+            typeof reason !== "string" ||
+            !reason.trim() ||
+            reason.trim().length > 500
+          )
+            errors.reason = "Enter a reason from 1 to 500 characters.";
+          if (Object.keys(errors).length)
+            return Response.json({ response_action: "errors", errors });
+          await enqueue("adjustment", {
+            recipient,
+            delta: Number(rawDelta),
+            reason: reason.trim(),
+          });
+        }
         return Response.json({ response_action: "clear" });
       }
       if (view.callback_id === "pizza_catalogue") {

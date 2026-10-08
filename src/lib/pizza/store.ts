@@ -1,12 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
-import { type PizzaConfig, DAILY_LIMIT } from "./config";
+import { type PizzaConfig } from "./config";
 import { type AwardInput } from "./parser";
 import { type Identity, eligible, localDay, rejection } from "./policy";
 import { redemptionBlocks, escapeSlackText } from "./blocks";
 import { type Period, rankStandings } from "./periods";
 import { type CelebrationSnapshot } from "./celebrations";
 import { isTier, type Tier } from "./rewards";
+import {
+  settingsFromRow,
+  validSettings,
+  validAdjustment,
+  settingsSummary,
+  type PizzaSettings,
+  type SettingsValues,
+} from "./settings";
 
 export type Job = {
   id: string;
@@ -187,11 +195,12 @@ export class PizzaStore {
         await this.complete(client, job, prior.result === "rejected");
         return prior.result;
       }
+      const settings = await this.settings(job.team_id, client, "shared");
       await this.identity(client, job.team_id, identities, c);
       const day = localDay(a.ts);
       await client.query(
-        "INSERT INTO pizza_daily_usage(team_id,giver_id,local_day) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-        [job.team_id, a.giver, day],
+        "INSERT INTO pizza_daily_usage(team_id,giver_id,local_day,daily_limit) VALUES($1,$2,$3,$4) ON CONFLICT(team_id,giver_id,local_day) DO UPDATE SET daily_limit=excluded.daily_limit",
+        [job.team_id, a.giver, day, settings.dailyLimit],
       );
       const used = (
         await client.query(
@@ -205,7 +214,15 @@ export class PizzaStore {
       );
       const reject =
           channelRejection ??
-          rejection(a.giver, a.recipients, a.total, used, identities, c),
+          rejection(
+            a.giver,
+            a.recipients,
+            a.total,
+            used,
+            identities,
+            c,
+            settings.dailyLimit,
+          ),
         id = randomUUID();
       await client.query(
         "INSERT INTO pizza_awards(id,team_id,channel_id,message_ts,giver_id,local_day,reason,total,result,rejection) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
@@ -259,7 +276,7 @@ export class PizzaStore {
         {
           text:
             reject ??
-            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slices each (1 🍕 = 1 slice). You have ${DAILY_LIMIT - used - a.total} left to give for ${day} (Asia/Dubai).`,
+            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slices each (1 🍕 = 1 slice). You have ${Math.max(0, settings.dailyLimit - used - a.total)} left to give for ${day} (Asia/Dubai).`,
         },
       );
       await this.complete(client, job, !!reject);
@@ -280,10 +297,16 @@ export class PizzaStore {
           [team, user, localDay()],
         )
       ).rows[0]?.used ?? 0;
-    return { ...row, remaining: DAILY_LIMIT - used } as {
+    const settings = await this.settings(team);
+    return {
+      ...row,
+      remaining: Math.max(0, settings.dailyLimit - used),
+      dailyLimit: settings.dailyLimit,
+    } as {
       earned: number;
       balance: number;
       remaining: number;
+      dailyLimit: number;
     };
   }
   async leaderboard(
@@ -379,6 +402,11 @@ export class PizzaStore {
         "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
         [`${team}:celebration-schedule`],
       );
+      const settings = await this.settings(team, client, "shared");
+      if (
+        !(p.kind === "week" ? settings.weeklyEnabled : settings.monthlyEnabled)
+      )
+        return false;
       if (await this.pendingAwards(client, team, p)) return false;
       const count = (
         await client.query(
@@ -472,6 +500,188 @@ export class PizzaStore {
       );
       await this.complete(client, job);
     });
+  }
+  async settings(
+    team: string,
+    client: Pick<PoolClient, "query"> = this.db,
+    lock?: "shared" | "exclusive",
+  ): Promise<PizzaSettings> {
+    if (lock)
+      await client.query(
+        `SELECT pg_advisory_xact_lock${lock === "shared" ? "_shared" : ""}(hashtextextended($1,0))`,
+        [`${team}:settings`],
+      );
+    return settingsFromRow(
+      (
+        await client.query("SELECT * FROM pizza_settings WHERE team_id=$1", [
+          team,
+        ])
+      ).rows[0],
+    );
+  }
+  private adminIdentity(job: Job, actor: Identity, c: PizzaConfig) {
+    if (
+      job.team_id !== c.team ||
+      actor.id !== job.payload.user ||
+      !c.admins.includes(actor.id) ||
+      !eligible(actor, c)
+    )
+      throw new Refusal("Only configured eligible staff admins can do that.");
+  }
+  async saveSettings(job: Job, actor: Identity, c: PizzaConfig) {
+    this.adminIdentity(job, actor, c);
+    const { version, values } = job.payload;
+    if (
+      !Number.isInteger(version) ||
+      Number(version) < 0 ||
+      !validSettings(values)
+    )
+      throw new Refusal("Invalid settings values.");
+    return this.tx(async (client) => {
+      await this.guard(client, job);
+      const old = await this.settings(job.team_id, client, "exclusive");
+      if (old.version !== version)
+        throw new Refusal(
+          "Settings changed since this modal opened. Refresh /pizza admin settings and save again.",
+        );
+      const unchanged = Object.keys(values).every(
+        (key) =>
+          old[key as keyof SettingsValues] ===
+          values[key as keyof SettingsValues],
+      );
+      if (!unchanged) {
+        const next = { ...values, version: old.version + 1 };
+        await client.query(
+          `INSERT INTO pizza_settings(team_id,version,daily_limit,small_cost,medium_cost,large_cost,weekly_enabled,monthly_enabled)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(team_id) DO UPDATE SET version=excluded.version,daily_limit=excluded.daily_limit,small_cost=excluded.small_cost,medium_cost=excluded.medium_cost,large_cost=excluded.large_cost,weekly_enabled=excluded.weekly_enabled,monthly_enabled=excluded.monthly_enabled`,
+          [
+            job.team_id,
+            next.version,
+            next.dailyLimit,
+            next.smallCost,
+            next.mediumCost,
+            next.largeCost,
+            next.weeklyEnabled,
+            next.monthlyEnabled,
+          ],
+        );
+        await client.query(
+          "INSERT INTO pizza_settings_changes(team_id,job_id,actor,old_values,new_values) VALUES($1,$2,$3,$4,$5)",
+          [job.team_id, job.id, actor.id, old, next],
+        );
+      }
+      await this.notify(
+        client,
+        job.team_id,
+        `settings:${job.id}`,
+        { kind: "ephemeral", channel: c.adminChannel, user: actor.id },
+        {
+          text: unchanged
+            ? "Settings are unchanged; no history entry created."
+            : `Settings saved by <@${actor.id}>.\n${settingsSummary({ ...values, version: old.version + 1 })}`,
+        },
+      );
+      await this.complete(client, job);
+    });
+  }
+  async adjustBalance(
+    job: Job,
+    actor: Identity,
+    target: Identity,
+    c: PizzaConfig,
+  ) {
+    this.adminIdentity(job, actor, c);
+    const { recipient, delta, reason } = job.payload;
+    if (
+      recipient !== target.id ||
+      !eligible(target, c) ||
+      !validAdjustment(delta, reason)
+    )
+      throw new Refusal(
+        "Choose eligible staff, a nonzero integer adjustment and a reason up to 500 characters.",
+      );
+    const change = Number(delta),
+      explanation = String(reason).trim();
+    return this.tx(async (client) => {
+      await this.guard(client, job);
+      await this.identity(client, job.team_id, [target], c);
+      const account = (
+        await client.query(
+          "SELECT balance FROM pizza_users WHERE team_id=$1 AND user_id=$2 FOR UPDATE",
+          [job.team_id, target.id],
+        )
+      ).rows[0];
+      const after = account.balance + change;
+      if (after < 0 || after > 2147483647)
+        throw new Refusal(
+          "Adjustment would make available balance negative or exceed its maximum.",
+        );
+      await client.query(
+        "INSERT INTO pizza_balance_adjustments(team_id,job_id,actor,recipient,delta,reason,before_balance,after_balance) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+        [
+          job.team_id,
+          job.id,
+          actor.id,
+          target.id,
+          change,
+          explanation,
+          account.balance,
+          after,
+        ],
+      );
+      await client.query(
+        "INSERT INTO pizza_ledger(team_id,user_id,kind,reference_id,actor,earned_delta,balance_delta,operation_key) VALUES($1,$2,'adjustment',$3,$4,0,$5,$6)",
+        [
+          job.team_id,
+          target.id,
+          job.id,
+          actor.id,
+          change,
+          `adjustment:${job.id}`,
+        ],
+      );
+      await client.query(
+        "UPDATE pizza_users SET balance=$3 WHERE team_id=$1 AND user_id=$2",
+        [job.team_id, target.id, after],
+      );
+      const text = `Balance adjustment ${job.id}\nAdmin: <@${actor.id}> · Recipient: <@${target.id}>\nAvailable slices: ${account.balance} → ${after} (${change > 0 ? "+" : ""}${change}). Earned recognition and giving allowance stay unchanged.`;
+      const payload = {
+        text,
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text } },
+          {
+            type: "section",
+            text: { type: "plain_text", text: `Reason: ${explanation}` },
+          },
+        ],
+      };
+      await this.notify(
+        client,
+        job.team_id,
+        `adjustment-admin:${job.id}`,
+        { kind: "ephemeral", channel: c.adminChannel, user: actor.id },
+        payload,
+      );
+      await this.notify(
+        client,
+        job.team_id,
+        `adjustment-recipient:${job.id}`,
+        { kind: "ephemeral", channel: c.recognitionChannel, user: target.id },
+        payload,
+      );
+      await this.complete(client, job);
+    });
+  }
+  async adminHistory(team: string, page = 0) {
+    return (
+      await this.db.query(
+        `SELECT * FROM (
+      SELECT job_id,actor,'settings'::text AS kind,created_at,NULL::text AS recipient,NULL::integer AS delta,NULL::text AS reason,NULL::integer AS before_balance,NULL::integer AS after_balance,old_values,new_values FROM pizza_settings_changes WHERE team_id=$1
+      UNION ALL SELECT job_id,actor,'adjustment'::text,created_at,recipient,delta,reason,before_balance,after_balance,NULL::jsonb,NULL::jsonb FROM pizza_balance_adjustments WHERE team_id=$1
+    ) history ORDER BY created_at DESC,job_id DESC LIMIT 10 OFFSET $2`,
+        [team, page * 10],
+      )
+    ).rows;
   }
   async rewards(team: string, admin = false, page = 0): Promise<Reward[]> {
     return (

@@ -49,6 +49,17 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 describe("dedicated bounded Slack client", () => {
+  it("fresh adjustment identity bypasses cached membership", async () => {
+    const api = new PizzaSlack(c);
+    expect((await api.identity("U1")).is_restricted).toBeUndefined();
+    mock.user.mockResolvedValue({
+      user: { id: "U1", team_id: "T1", is_restricted: true },
+    });
+    expect((await api.identity("U1")).is_restricted).toBeUndefined();
+    expect((await api.identity("U1", true)).is_restricted).toBe(true);
+    expect(mock.user).toHaveBeenCalledTimes(2);
+  });
+
   it("uses only PizzaBot token with zero internal retries and bounded calls", () => {
     new PizzaSlack(c);
     expect(mock.constructor).toHaveBeenCalledWith(
