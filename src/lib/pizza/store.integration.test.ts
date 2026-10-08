@@ -1,7 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { Pool } from "pg";
 import { beforeAll, afterAll, beforeEach, describe, it, expect } from "vitest";
 import { PizzaStore, Refusal, LostLease, type Job, type Outbox } from "./store";
+import { period, latestDue } from "./periods";
+import { scheduleCelebrations } from "./celebrations";
+import { type PizzaSlack } from "./slack";
 import { config } from "./config";
 import { type AwardInput } from "./parser";
 import { type Identity } from "./policy";
@@ -94,19 +97,18 @@ describe.skipIf(!dsn)(
         options: `-c search_path=${schema},public`,
       });
       s = new PizzaStore(pool);
-      const migration = await readFile(
-        new URL(
-          "../../../db/migrations/2026-10-08_pizza_recognition.sql",
-          import.meta.url,
-        ),
-        "utf8",
-      );
-      await pool.query(migration);
-      await pool.query(migration); // Exercise guards outside the history runner as well.
+      const directory = new URL("../../../db/migrations/", import.meta.url);
+      for (const name of (await readdir(directory))
+        .filter((name) => name.endsWith(".sql"))
+        .sort()) {
+        const migration = await readFile(new URL(name, directory), "utf8");
+        await pool.query(migration);
+        await pool.query(migration);
+      }
     });
     beforeEach(async () => {
       await pool.query(
-        "TRUNCATE pizza_users,pizza_inbox,pizza_daily_usage,pizza_awards,pizza_award_recipients,pizza_rewards,pizza_redemption_intents,pizza_redemptions,pizza_ledger,pizza_outbox RESTART IDENTITY CASCADE",
+        "TRUNCATE pizza_celebrations,pizza_reward_goals,pizza_users,pizza_inbox,pizza_daily_usage,pizza_awards,pizza_award_recipients,pizza_rewards,pizza_redemption_intents,pizza_redemptions,pizza_ledger,pizza_outbox RESTART IDENTITY CASCADE",
       );
     });
     afterAll(async () => {
@@ -463,10 +465,408 @@ describe.skipIf(!dsn)(
       const r = await reward(),
         i = await s.intent(c.team, "U2", r.id);
       await redeem("U2", i.id);
-      expect(await s.leaderboard(c.team, true)).toEqual([
-        { recipient_id: "U2", earned: 2 },
-        { recipient_id: "U3", earned: 2 },
+      expect(await s.leaderboard(c.team, period("all"))).toEqual([
+        { user_id: "U2", slices: 2, rank: 1 },
+        { user_id: "U3", slices: 2, rank: 1 },
       ]);
+    });
+    it("given standings avoid recipient join inflation and both scores ignore spending", async () => {
+      await give(award("U1", ["U2", "U3"], 1));
+      await give(award("U1", ["U2"], 2));
+      await give(award("U4", ["U3"], 3));
+      const all = period("all"),
+        snapshot = await s.celebrationSnapshot(c.team, all);
+      expect(snapshot).toMatchObject({
+        messages: 3,
+        slices: 7,
+        givers: 2,
+        recipients: 2,
+        participants: 4,
+      });
+      expect(snapshot.given).toEqual([
+        { user_id: "U1", slices: 4, teammates: 2, rank: 1 },
+        { user_id: "U4", slices: 3, teammates: 1, rank: 2 },
+      ]);
+      const r = await reward(2),
+        i = await s.intent(c.team, "U2", r.id);
+      await redeem("U2", i.id);
+      expect(await s.leaderboard(c.team, all, "received")).toEqual(
+        snapshot.received,
+      );
+      expect(await s.leaderboard(c.team, all, "given")).toEqual(snapshot.given);
+    });
+    it("uses start-inclusive/end-exclusive original timestamp, with microsecond precision", async () => {
+      const p = latestDue("week", new Date("2026-10-09T12:00:00Z")),
+        start = p.start!.getTime() / 1000,
+        end = p.end!.getTime() / 1000;
+      for (const stamp of [
+        `${start}.000000`,
+        `${end}.000000`,
+        `${end - 1}.999999`,
+        `${start - 1}.999999`,
+      ])
+        await give({ ...award("U1", ["U2"], 1), ts: stamp });
+      expect((await s.celebrationSnapshot(c.team, p)).messages).toBe(2);
+      const current = period("week", p.end!);
+      expect((await s.celebrationSnapshot(c.team, current)).messages).toBe(1);
+    });
+    it("Dubai calendar year transition uses original timestamps and genuine deterministic highlights", async () => {
+      const p = period("month", new Date("2027-01-02T00:00:00Z")),
+        start = p.start!.getTime() / 1000,
+        end = p.end!.getTime() / 1000;
+      const reasons = [
+        "before month",
+        "thanks for the real launch",
+        "real final handover",
+        "next month",
+      ];
+      const stamps = [
+        `${start - 1}.999999`,
+        `${start}.000000`,
+        `${end - 1}.999999`,
+        `${end}.000000`,
+      ];
+      for (let i = 0; i < stamps.length; i++)
+        await give({
+          ...award(`U1${i}`, [`U2${i}`], 1),
+          ts: stamps[i],
+          reason: reasons[i],
+        });
+      const first = await s.celebrationSnapshot(c.team, p),
+        second = await s.celebrationSnapshot(c.team, p);
+      expect(first.messages).toBe(2);
+      expect(first.highlights).toEqual(second.highlights);
+      expect(first.highlights.map((h) => h.reason).sort()).toEqual(
+        [reasons[1], reasons[2]].sort(),
+      );
+      expect(new Set(first.highlights.map((h) => h.id)).size).toBe(2);
+      expect(new Set(first.highlights.map((h) => h.recipient)).size).toBe(2);
+      expect(first.highlights.every((h) => h.channel === "C1")).toBe(true);
+    });
+    it("all top ties are counted beyond the private top-ten list", async () => {
+      for (let n = 0; n < 13; n++) await give(award(`U1${n}`, [`U3${n}`], 1));
+      const snapshot = await s.celebrationSnapshot(c.team, period("all"));
+      expect(snapshot.received).toHaveLength(13);
+      expect(snapshot.received.every((row) => row.rank === 1)).toBe(true);
+      expect(await s.leaderboard(c.team, period("all"))).toHaveLength(10);
+    });
+    it("celebration receipt and outbox commit once under concurrent drains and restart", async () => {
+      const p = latestDue("week", new Date("2026-10-09T12:00:00Z"));
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          s.queueCelebration(
+            c.team,
+            p,
+            0,
+            { text: "Empty truthful recap" },
+            "C1",
+          ),
+        ),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(
+        await new PizzaStore(pool).queueCelebration(
+          c.team,
+          p,
+          0,
+          { text: "Retry" },
+          "C1",
+        ),
+      ).toBe(false);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_celebrations"))
+          .rows[0].n,
+      ).toBe(1);
+      expect(
+        (
+          await pool.query(
+            "SELECT count(*)::int n FROM pizza_outbox WHERE notification_key LIKE 'celebration:%'",
+          )
+        ).rows[0].n,
+      ).toBe(1);
+    });
+    it("pending in-period awards delay recap; accepted changes during link lookup force a new snapshot", async () => {
+      const p = latestDue("week", new Date("2026-10-09T12:00:00Z")),
+        a = {
+          ...award(),
+          ts: String(p.start!.getTime() / 1000 + 10) + ".000001",
+        },
+        j = await job("award", a);
+      expect(await s.celebrationReady(c.team, p)).toBe(false);
+      expect(
+        await s.queueCelebration(c.team, p, 0, { text: "Stale" }, "C1"),
+      ).toBe(false);
+      await s.award(j, a, [user("U1"), user("U2")], c);
+      expect(
+        await s.queueCelebration(c.team, p, 0, { text: "Stale" }, "C1"),
+      ).toBe(false);
+      const snapshot = await s.celebrationSnapshot(c.team, p);
+      expect(snapshot.messages).toBe(1);
+      await s.enqueue(c.team, "future", "award", {
+        ...a,
+        ts: String(p.end!.getTime() / 1000 + 1) + ".000001",
+      });
+      expect(
+        await s.queueCelebration(
+          c.team,
+          p,
+          snapshot.messages,
+          { text: "Fresh" },
+          "C1",
+        ),
+      ).toBe(true);
+    });
+    it("scheduler guards activation/pause and bounds outage recovery to latest week/month", async () => {
+      const api = { permalink: async () => null } as unknown as PizzaSlack,
+        enabled = {
+          ...c,
+          celebrationsEnabled: true,
+          celebrationsStartAt: new Date("2026-10-08T00:00:00Z"),
+        };
+      expect(
+        await scheduleCelebrations(
+          s,
+          api,
+          enabled,
+          new Date("2026-10-08T10:00:00Z"),
+        ),
+      ).toBe(0);
+      expect(
+        await scheduleCelebrations(
+          s,
+          api,
+          { ...enabled, enabled: false },
+          new Date("2026-12-15T10:00:00Z"),
+        ),
+      ).toBe(0);
+      expect(
+        await scheduleCelebrations(
+          s,
+          api,
+          enabled,
+          new Date("2026-12-15T10:00:00Z"),
+        ),
+      ).toBe(2);
+      expect(
+        await scheduleCelebrations(
+          new PizzaStore(pool),
+          api,
+          enabled,
+          new Date("2026-12-15T10:00:00Z"),
+        ),
+      ).toBe(0);
+      expect(
+        (
+          await pool.query(
+            "SELECT period_kind,period_start FROM pizza_celebrations ORDER BY period_kind",
+          )
+        ).rows,
+      ).toHaveLength(2);
+    });
+    it("failed outbox insertion rolls back schedule receipt and later drain recovers it", async () => {
+      const p = latestDue("week", new Date("2026-10-09T12:00:00Z"));
+      await pool.query(
+        "CREATE FUNCTION test_fail_celebration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'temporary outbox failure'; END $$; CREATE TRIGGER test_fail_celebration BEFORE INSERT ON pizza_outbox FOR EACH ROW EXECUTE FUNCTION test_fail_celebration()",
+      );
+      await expect(
+        s.queueCelebration(c.team, p, 0, { text: "Recap" }, "C1"),
+      ).rejects.toThrow(/temporary/);
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_celebrations"))
+          .rows[0].n,
+      ).toBe(0);
+      await pool.query(
+        "DROP TRIGGER test_fail_celebration ON pizza_outbox; DROP FUNCTION test_fail_celebration()",
+      );
+      expect(
+        await s.queueCelebration(c.team, p, 0, { text: "Recap" }, "C1"),
+      ).toBe(true);
+    });
+    it("goal can precede first award, change and clear without ledger/account side effects", async () => {
+      const a = await reward(12),
+        b = await reward(6);
+      await s.setGoal(
+        await job("goal", { user: "U5", reward: a.id }),
+        user("U5"),
+        c,
+      );
+      expect((await s.goal(c.team, "U5"))!.cost).toBe(12);
+      expect((await s.balance(c.team, "U5")).balance).toBe(0);
+      expect(
+        (
+          await pool.query(
+            "SELECT count(*)::int n FROM pizza_users WHERE user_id='U5'",
+          )
+        ).rows[0].n,
+      ).toBe(0);
+      await s.setGoal(
+        await job("goal", { user: "U5", reward: b.id }),
+        user("U5"),
+        c,
+      );
+      expect((await s.goal(c.team, "U5"))!.id).toBe(b.id);
+      await s.setGoal(
+        await job("goal", { user: "U5", reward: null }),
+        user("U5"),
+        c,
+      );
+      expect(await s.goal(c.team, "U5")).toBeNull();
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_ledger")).rows[0]
+          .n,
+      ).toBe(0);
+    });
+    it("cross-team, unknown, archived, sold-out and spoofed goal requests fail", async () => {
+      const r = await reward();
+      await expect(
+        s.setGoal(
+          await job("goal", { user: "U2", reward: r.id }),
+          user("U3"),
+          c,
+        ),
+      ).rejects.toThrow(/own reward/);
+      await pool.query("UPDATE pizza_rewards SET team_id='T2' WHERE id=$1", [
+        r.id,
+      ]);
+      await expect(
+        s.setGoal(
+          await job("goal", { user: "U2", reward: r.id }),
+          user("U2"),
+          c,
+        ),
+      ).rejects.toThrow(/active/);
+      await pool.query(
+        "UPDATE pizza_rewards SET team_id='T1',active=false WHERE id=$1",
+        [r.id],
+      );
+      await expect(
+        s.setGoal(
+          await job("goal", { user: "U2", reward: r.id }),
+          user("U2"),
+          c,
+        ),
+      ).rejects.toThrow(/active/);
+      await pool.query(
+        "UPDATE pizza_rewards SET active=true,stock=0 WHERE id=$1",
+        [r.id],
+      );
+      await expect(
+        s.setGoal(
+          await job("goal", { user: "U2", reward: r.id }),
+          user("U2"),
+          c,
+        ),
+      ).rejects.toThrow(/active/);
+      await expect(
+        s.setGoal(
+          await job("goal", {
+            user: "U2",
+            reward: "11111111-1111-4111-8111-111111111111",
+          }),
+          user("U2"),
+          c,
+        ),
+      ).rejects.toThrow(/active/);
+      expect(await s.goal(c.team, "U2")).toBeNull();
+    });
+    it("goal reads latest price/availability; custom tier price remains explicitly chosen", async () => {
+      const add = await job("catalogue", {
+        reward: "new",
+        name: "Real prize",
+        cost: 7,
+        description: "Georgia decides",
+        stock: 1,
+        tier: "large",
+      });
+      await s.catalogue(add, user("U9"), c);
+      const r = (await s.rewards(c.team))[0];
+      expect(r).toMatchObject({ tier: "large", cost: 7 });
+      await s.setGoal(
+        await job("goal", { user: "U2", reward: r.id }),
+        user("U2"),
+        c,
+      );
+      await pool.query(
+        "UPDATE pizza_rewards SET cost=12,active=false WHERE id=$1",
+        [r.id],
+      );
+      expect(await s.goal(c.team, "U2")).toMatchObject({
+        cost: 12,
+        active: false,
+      });
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_ledger")).rows[0]
+          .n,
+      ).toBe(0);
+    });
+    it("removes delivered recap quote copies after 30 days while preserving pending content/receipts", async () => {
+      const p = latestDue("week", new Date("2026-10-09T12:00:00Z"));
+      await s.queueCelebration(
+        c.team,
+        p,
+        0,
+        { text: "Summary", blocks: [{ text: "private excerpt" }] },
+        "C1",
+      );
+      await pool.query(
+        "UPDATE pizza_outbox SET created_at=now()-interval '31 days'",
+      );
+      await s.maintenance(c.team);
+      expect(
+        (await pool.query("SELECT payload FROM pizza_outbox")).rows[0].payload
+          .blocks,
+      ).toBeDefined();
+      await pool.query("UPDATE pizza_outbox SET status='sent'");
+      await s.maintenance(c.team);
+      expect(
+        (await pool.query("SELECT payload,notification_key FROM pizza_outbox"))
+          .rows[0].payload.blocks,
+      ).toBeUndefined();
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_celebrations"))
+          .rows[0].n,
+      ).toBe(1);
+    });
+    it("private preview results clear response capability and redact excerpts without a public receipt", async () => {
+      const preview = await job("command", {
+        user: "U9",
+        channel: "G2",
+        responseUrl: "https://hooks.slack.com/commands/secret",
+        responseExpires: Date.now() + 60000,
+      });
+      await s.finish(
+        preview,
+        { text: "Private preview", blocks: [{ text: "original reason" }] },
+        false,
+        "preview",
+      );
+      const delivery = (await s.claim("pizza_outbox", c.team)) as Outbox;
+      expect(delivery.notification_key).toBe(`preview:${preview.id}`);
+      expect(delivery.target.kind).toBe("response");
+      await s.delivered(delivery);
+      expect(
+        (
+          await pool.query("SELECT payload FROM pizza_inbox WHERE id=$1", [
+            preview.id,
+          ])
+        ).rows[0].payload.responseUrl,
+      ).toBeUndefined();
+      await pool.query(
+        "UPDATE pizza_outbox SET created_at=now()-interval '31 days'",
+      );
+      await s.maintenance(c.team);
+      const row = (
+        await pool.query(
+          "SELECT payload,notification_key,status FROM pizza_outbox",
+        )
+      ).rows[0];
+      expect(row.payload.blocks).toBeUndefined();
+      expect(row.notification_key).toBe(`preview:${preview.id}`);
+      expect(row.status).toBe("sent");
+      expect(
+        (await pool.query("SELECT count(*)::int n FROM pizza_celebrations"))
+          .rows[0].n,
+      ).toBe(0);
     });
     it("outbox retries and expired leases do not change ledger; response secrets removed on delivery", async () => {
       await give();

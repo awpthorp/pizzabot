@@ -11,8 +11,8 @@ AI model dependency.
 
 Five pizzas to give per original message's Asia/Dubai calendar day, including
 weekends. Receiving does not replenish giving. Lifetime earned and available
-balance are distinct; redemption spends available points without changing earned
-leaderboard scores. Unused giving allowance expires at midnight; no reset job.
+balance are distinct; one received 🍕 earns one slice. Redemption spends available
+slices without changing earned leaderboard scores. Unused giving allowance expires at midnight; no reset job.
 
 Every unique direct mention receives the total pizza count in message text:
 `@Mike @Sarah 🍕🍕` gives two each and costs four. Duplicate mentions count once.
@@ -23,14 +23,36 @@ invalid recipients and insufficient allowance reject the whole award privately.
 Bots, deleted users, guests and external members are ineligible. An optional
 participant allowlist can restrict eligible regular members to staff.
 
-Commands: `/pizza` or `balance`, `help`, `leaderboard [month|all]`, `rewards`,
-and admin-only `admin`. The month leaderboard uses the Dubai calendar month and
-earned points, with Slack IDs breaking ties. `/pizza admin` shows reward controls,
-pending requests, and ambiguous notifications. `/pizza admin rewards [page]`,
-`requests [page]`, and `deliveries [page]` show additional records; pages start at 0.
+Commands: `/pizza` or `balance`, `help`, `leaderboard [week|month|all]
+[received|given]`, `rewards`, `goal clear`, and admin-only `admin`. The default
+leaderboard is this month's received slices. Given standings count accepted
+slices given and distinct teammates thanked. Scores use original Slack message
+timestamps, independently of spending. Ties share ranks (1, 1, 3), with stable
+Slack ID order within ties. Weeks run Friday 16:00 to the next Friday 16:00 in
+Asia/Dubai; months use the Dubai calendar. Every bounded leaderboard prints its
+exact dates, including the exclusive end.
+
+`/pizza admin` shows reward controls, pending requests, and ambiguous notifications.
+`/pizza admin rewards [page]`, `requests [page]`, and `deliveries [page]` show
+additional records; pages start at 0. `/pizza admin preview [week|month]` privately
+shows the current period to a configured eligible admin, even before celebrations
+are enabled. A preview creates no public report or scheduling receipt.
 
 The initial reward catalogue is empty. Admins add/edit/archive rewards via modals,
-including positive integer cost, fulfilment description and optional stock.
+including positive integer slice cost, fulfilment description and optional stock.
+Add Small, Medium and Large open editable presets of 6, 8 and 12 slices; Custom
+keeps existing rewards valid. The tier is a label: changing it never silently
+changes the entered price. Georgia chooses the actual names, prizes and stock.
+No tier promises a prize and no reward is seeded automatically.
+
+Staff can Track reward from the catalogue, switch goals, or clear a goal from
+balance or `/pizza goal clear`. Tracking is available before earning any slices;
+it reserves no stock and spends nothing. Balance shows the current price,
+available slices, remaining amount or readiness, and current availability. A
+small/medium/large progress meter has one cell per required slice; custom costs
+above 12 use a fixed 12-cell meter labeled proportional. Archived or sold-out
+goals remain visible as unavailable until changed or cleared.
+
 Opening/cancelling a confirmation spends nothing. Submission checks current
 eligibility, stock and confirmed price, then debits once and creates a pending
 request. Price changes require renewed confirmation. Alex and Georgia receive
@@ -61,9 +83,10 @@ DATABASE_URL=postgresql://localhost/pizza_migrate_test npm run migrate
 ```
 
 Integration tests refuse remote hosts and create/drop their own isolated schema.
-The managed runner applies only `db/migrations/2026-10-08_pizza_recognition.sql`
-in this repository, under an advisory lock with immutable checksums. Repeated
-apply executes no migration SQL. Never edit a migration after production apply.
+The managed runner applies all SQL files in `db/migrations` in filename order,
+under an advisory lock with immutable checksums. The original recognition
+migration stays unchanged; celebrations, reward tiers and goals use a new
+migration. Repeated apply executes no migration SQL. Never edit a migration after production apply.
 `npm run verify` includes unit tests, worker and migration Node tests, and TypeScript.
 
 ## Slack installation
@@ -89,6 +112,38 @@ characters, different from the Slack signing secret. App credentials never fall
 back to Assistant credentials. Set `PIZZA_ENABLED=true` only after the independent
 worker, channels and test checks are ready. Disable it to pause new mutations
 while still allowing committed notification delivery and reconciliation.
+
+## Celebrations
+
+The existing authenticated five-minute drain schedules weekly reports after
+Friday 16:00 Dubai and monthly reports after 10:00 Dubai on the first day of the
+month, covering the previous completed calendar month. The next drain delivers
+them; this is not an exact-minute scheduler. Reports celebrate every tied pizza
+champion and top giver, show the top three received ranks with ties, team totals,
+and up to two genuine saved recognition excerpts linked to their original
+messages. Missing/deleted/unavailable links are omitted. Quotes are bounded
+literal text; there is no generated praise. Slack's
+[chat.getPermalink method](https://docs.slack.dev/reference/methods/chat.getPermalink/)
+requires no additional scopes.
+
+Set `PIZZA_CELEBRATIONS_ENABLED=true` and a valid explicit ISO timestamp in
+`PIZZA_CELEBRATIONS_START_AT` only at launch. Reports whose due time is earlier
+than activation are never scheduled. Missing or invalid activation disables
+scheduling while recognition continues. `PIZZA_ENABLED=false` pauses new reports
+and mutations; committed deliveries continue. After an outage only the latest
+due weekly and monthly periods are considered, avoiding a flood of old reports.
+
+A unique team/period receipt and its stable outbox payload commit together.
+Concurrent drains cannot enqueue the same report twice. Pending accepted award
+jobs within the period delay its snapshot; the final transaction also rechecks
+for newly accepted work. Reports describe the accepted awards at that snapshot:
+late Slack events arriving after a report commits do not revise a published post.
+Slack permalink requests run outside database locks. Known delivery failures
+retry; ambiguous delivery waits for manual review and is never blindly reposted.
+
+Leaderboards and celebrations award no automatic prizes. Rewards are separately
+chosen by admins and redeemed using available slices with the existing private
+confirmation, stock checks and manual fulfilment/refund process.
 
 ## Railway web and worker
 
@@ -153,18 +208,26 @@ SELECT id, notification_key, external_ref, safe_error
 FROM pizza_outbox WHERE status='ambiguous';
 ```
 
-Check Slack for the stable request ID. If the message exists, record its Slack
-reference and set status `sent`; if absent, set `status='pending', retry_at=now()`
+For a reward notification check Slack for the stable request ID; for a
+`celebration:` notification check the report type and period/date in `#pizza`.
+Private `preview:` notifications are admin replies, not fulfilment requests.
+If the message exists, record its Slack reference and set status `sent`; if absent, set `status='pending', retry_at=now()`
 to retry. Never alter ledger rows. Response URLs are secret capabilities; only
 supported Slack response hosts/paths are used, redirects are rejected, and they
 are removed after delivery/expiry. Expired private command replies can be obtained
 by invoking `/pizza` again. Worker maintenance purges terminal inbox payloads and
-recognition reasons after 30 days. Duplicate keys, allocations and the append-only
-ledger remain for the scheme's lifetime. Logs use only safe error codes.
+recognition reasons after 30 days. Terminal celebration and private-preview
+outbox payloads are also redacted after 30 days, retaining receipt, notification
+key and delivery status. Pending/running reports keep their content until delivery
+resolution. Duplicate keys, allocations and the append-only ledger remain for
+the scheme's lifetime. Logs use only safe error codes.
 
 ## Activation smoke check
 
-- Verify all Slack endpoints, `/pizza help`, balance and both leaderboard periods.
+- Verify all Slack endpoints, `/pizza help`, balance, all leaderboard periods and
+  both modes, tier presets, tracking/clearing a goal,
+  and private admin previews. Enable celebrations with a launch timestamp only
+  after these checks pass.
 - Send `@Mike @Sarah 🍕🍕`: two each, four consumed, thread reply. Retry the same
   event and confirm no duplicate accounting; test self/bot/guest/over-budget gifts.
 - Configure a test reward as an admin. Open/cancel then redeem; check private

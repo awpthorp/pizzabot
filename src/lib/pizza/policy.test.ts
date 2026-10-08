@@ -64,4 +64,27 @@ describe("policy and configuration", () => {
       ),
     ).toMatch(/needs 6/);
   });
+  it("celebrations default off and invalid activation leaves core recognition enabled", () => {
+    expect(config(env)!.celebrationsEnabled).toBe(false);
+    for (const start of [
+      "bad",
+      "2026-10-08",
+      "2026-02-30T10:00:00Z",
+      "2026-10-08T24:00:00Z",
+    ]) {
+      const result = config({
+        ...env,
+        PIZZA_CELEBRATIONS_ENABLED: "true",
+        PIZZA_CELEBRATIONS_START_AT: start,
+      })!;
+      expect(result.enabled).toBe(true);
+      expect(result.celebrationsStartAt).toBeNull();
+    }
+    expect(
+      config({
+        ...env,
+        PIZZA_CELEBRATIONS_START_AT: "2026-10-08T14:00:00+04:00",
+      })!.celebrationsStartAt!.toISOString(),
+    ).toBe("2026-10-08T10:00:00.000Z");
+  });
 });

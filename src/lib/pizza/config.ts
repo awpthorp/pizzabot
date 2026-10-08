@@ -11,6 +11,8 @@ export type PizzaConfig = {
   admins: string[];
   participants: string[];
   workerSecret: string;
+  celebrationsEnabled: boolean;
+  celebrationsStartAt: Date | null;
 };
 export function config(
   env: Record<string, string | undefined> = process.env,
@@ -31,6 +33,8 @@ export function config(
     admins: ids("PIZZA_ADMIN_USER_IDS"),
     participants: ids("PIZZA_PARTICIPANT_USER_IDS"),
     workerSecret: env.PIZZA_WORKER_SECRET ?? "",
+    celebrationsEnabled: env.PIZZA_CELEBRATIONS_ENABLED === "true",
+    celebrationsStartAt: validStart(env.PIZZA_CELEBRATIONS_START_AT),
   };
   if (
     !c.token.startsWith("xoxb-") ||
@@ -46,4 +50,23 @@ export function config(
   )
     return null;
   return c;
+}
+
+function validStart(value: string | undefined): Date | null {
+  if (
+    !value ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    )
+  )
+    return null;
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  if (
+    new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) !==
+      value.slice(0, 10) ||
+    Number(value.slice(11, 13)) > 23
+  )
+    return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms) : null;
 }

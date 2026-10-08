@@ -10,6 +10,7 @@ import { store, Refusal } from "@/lib/pizza/store";
 import { slack } from "@/lib/pizza/slack";
 import { eligible } from "@/lib/pizza/policy";
 import { confirmationModal, rewardModal } from "@/lib/pizza/blocks";
+import { isTier } from "@/lib/pizza/rewards";
 import { drain } from "@/lib/pizza/worker";
 export const runtime = "nodejs";
 export async function POST(request: Request) {
@@ -63,7 +64,14 @@ export async function POST(request: Request) {
       if (!action || typeof action.action_id !== "string")
         return new Response("Malformed action", { status: 400 });
       if (
-        ["pizza_redeem", "pizza_add", "pizza_edit"].includes(action.action_id)
+        [
+          "pizza_redeem",
+          "pizza_add",
+          "pizza_add_small",
+          "pizza_add_medium",
+          "pizza_add_large",
+          "pizza_edit",
+        ].includes(action.action_id)
       ) {
         if (typeof body.trigger_id !== "string" || !body.trigger_id)
           return new Response("Missing trigger", { status: 400 });
@@ -95,8 +103,27 @@ export async function POST(request: Request) {
             throw new Refusal(
               "Please click again; the catalogue took too long to open.",
             );
-          await api.modal(body.trigger_id, rewardModal(reward ?? undefined));
+          const preset = action.action_id.slice("pizza_add_".length);
+          await api.modal(
+            body.trigger_id,
+            rewardModal(
+              reward ?? undefined,
+              isTier(preset) ? preset : undefined,
+            ),
+          );
         }
+        return new Response(null, { status: 200 });
+      }
+      if (["pizza_goal", "pizza_goal_clear"].includes(action.action_id)) {
+        if (action.action_id === "pizza_goal" && !uuid(action.value))
+          return new Response("Invalid reward", { status: 400 });
+        const url = responseUrl(body.response_url);
+        await enqueue("goal", {
+          reward: action.action_id === "pizza_goal_clear" ? null : action.value,
+          ...(url
+            ? { responseUrl: url, responseExpires: Date.now() + 25 * 60_000 }
+            : {}),
+        });
         return new Response(null, { status: 200 });
       }
       if (
@@ -152,8 +179,13 @@ export async function POST(request: Request) {
           name = get("name"),
           costText = get("cost"),
           description = get("description"),
-          stockText = get("stock");
+          stockText = get("stock"),
+          selectedTier =
+            values?.tier?.value?.selected_option?.value ?? "custom",
+          tier = selectedTier === "custom" ? null : selectedTier;
         const errors: Record<string, string> = {};
+        if (tier !== null && !isTier(tier))
+          errors.tier = "Choose Small, Medium, Large or Custom.";
         if (typeof name !== "string" || !name.trim() || name.length > 100)
           errors.name = "Enter a name up to 100 characters.";
         if (!/^[1-9]\d{0,6}$/.test(costText) || Number(costText) > 1000000)
@@ -170,6 +202,7 @@ export async function POST(request: Request) {
           return Response.json({ response_action: "errors", errors });
         await enqueue("catalogue", {
           reward: view.private_metadata,
+          tier,
           name,
           cost: Number(costText),
           description,

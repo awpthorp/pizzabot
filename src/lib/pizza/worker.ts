@@ -1,7 +1,19 @@
 import { type PizzaConfig } from "./config";
 import { type AwardInput } from "./parser";
 import { eligible } from "./policy";
-import { help, rewardsBlocks, redemptionBlocks } from "./blocks";
+import {
+  help,
+  rewardsBlocks,
+  redemptionBlocks,
+  goalText,
+  button,
+} from "./blocks";
+import { period } from "./periods";
+import {
+  scheduleCelebrations,
+  celebrationPayload,
+  linkedHighlights,
+} from "./celebrations";
 import { PizzaSlack, SlackTransient } from "./slack";
 import { PizzaStore, Refusal, LostLease, type Job, type Outbox } from "./store";
 function backoff(attempts: number) {
@@ -58,6 +70,10 @@ export async function processJob(
       await s.adminAction(job, identity, c);
       return;
     }
+    if (job.kind === "goal") {
+      await s.setGoal(job, identity, c);
+      return;
+    }
     if (job.kind === "catalogue") {
       await s.catalogue(job, identity, c);
       return;
@@ -68,19 +84,58 @@ export async function processJob(
         .split(/\s+/),
       command = words[0] || "balance";
     let result: Record<string, unknown>;
+    let preview = false;
     if (command === "balance") {
-      const b = await s.balance(c.team, user);
+      const b = await s.balance(c.team, user),
+        goal = await s.goal(c.team, user);
+      const text = `Lifetime earned: ${b.earned} slices\nAvailable to spend: ${b.balance} slices\nLeft to give today: ${b.remaining}/${5} 🍕\nReset: midnight Asia/Dubai. One received 🍕 = one slice.\n\n${goalText(b.balance, goal)}`;
       result = {
-        text: `Lifetime earned: ${b.earned} 🍕\nAvailable to spend: ${b.balance} 🍕\nLeft to give today: ${b.remaining}/${5} 🍕\nReset: midnight Asia/Dubai.`,
+        text,
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text } },
+          ...(goal
+            ? [
+                {
+                  type: "actions",
+                  elements: [button("Clear goal", "pizza_goal_clear", "clear")],
+                },
+              ]
+            : []),
+        ],
       };
     } else if (command === "help") result = { text: help };
-    else if (
-      command === "leaderboard" &&
-      (!words[1] || ["month", "all"].includes(words[1]))
-    ) {
-      const rows = await s.leaderboard(c.team, words[1] === "all");
+    else if (command === "goal" && words[1] === "clear") {
+      await s.setGoal(
+        { ...job, payload: { ...job.payload, reward: null } },
+        identity,
+        c,
+      );
+      return;
+    } else if (command === "admin" && words[1] === "preview") {
+      if (!c.admins.includes(user))
+        throw new Refusal("Only configured admins can preview celebrations.");
+      const kind = words[2] ?? "week";
+      if (kind !== "week" && kind !== "month")
+        throw new Refusal("Use /pizza admin preview [week|month].");
+      const p = period(kind),
+        snapshot = await s.celebrationSnapshot(c.team, p),
+        highlights = await linkedHighlights(api, snapshot);
+      preview = true;
+      result = celebrationPayload(p, snapshot, highlights, true);
+    } else if (command === "leaderboard") {
+      const kind = words[1] ?? "month",
+        mode = words[2] ?? "received";
+      if (
+        !["week", "month", "all"].includes(kind) ||
+        !["received", "given"].includes(mode)
+      )
+        throw new Refusal(
+          "Use /pizza leaderboard [week|month|all] [received|given].",
+        );
+      const p = period(kind as "week" | "month" | "all");
+      const rows = await s.leaderboard(c.team, p, mode as "received" | "given");
       result = {
-        text: `${words[1] === "all" ? "All-time" : "This Dubai month"} recognition leaderboard\n${rows.map((r, i) => `${i + 1}. <@${r.recipient_id}> — ${r.earned} 🍕`).join("\n") || "No recognition yet."}`,
+        text: `${mode === "given" ? "Given" : "Received"} recognition leaderboard\n${p.label}\n${rows.map((r) => `${r.rank}. <@${r.user_id}> — ${r.slices} slices${mode === "given" ? ` · ${r.teammates} teammates thanked` : ""}`).join("\n") || "No recognition yet."}`,
       };
     } else if (command === "rewards" || command === "admin") {
       if (command === "admin" && !c.admins.includes(user))
@@ -106,14 +161,14 @@ export async function processJob(
           type: "section",
           text: {
             type: "plain_text",
-            text: `Ambiguous delivery ${r.id}\n${r.notification_key}\n${r.safe_error}. Check Slack for its stable request ID before retrying; request buttons below act once.`,
+            text: `Ambiguous delivery ${r.id}\n${r.notification_key}\n${r.safe_error}. ${r.notification_key.startsWith("celebration:") ? "This is a recap: check the period/date in #pizza before retrying." : r.notification_key.startsWith("preview:") ? "This is a private preview, not a reward request." : "Check Slack for its stable request ID or command reply before retrying; request buttons below act once."}`,
           },
         }));
         const guide = {
           type: "section",
           text: {
             type: "plain_text",
-            text: `Admin view. /pizza admin requests [page] or deliveries [page] or rewards [page] (pages start at 0). Pending request actions work even when the original notification is ambiguous.`,
+            text: `Admin view. /pizza admin preview [week|month] gives a private current-period preview. /pizza admin requests [page] or deliveries [page] or rewards [page] (pages start at 0). Pending request actions work even when the original notification is ambiguous.`,
           },
         };
         result = {
@@ -128,7 +183,17 @@ export async function processJob(
                   : [
                       guide,
                       ...rewardsBlocks(rows.slice(0, 8), true),
-                      ...requests,
+                      ...state.requests
+                        .slice(0, 8)
+                        .flatMap((r) =>
+                          redemptionBlocks(
+                            r.id,
+                            r.user_id,
+                            r.reward_name,
+                            r.cost,
+                            r.description,
+                          ),
+                        ),
                       ...deliveries.slice(0, 5),
                     ],
         };
@@ -140,7 +205,8 @@ export async function processJob(
           blocks: rewardsBlocks(rows),
         };
     } else result = { text: help };
-    await s.finish(job, result);
+    if (preview) await s.finish(job, result, false, "preview");
+    else await s.finish(job, result);
   } catch (error) {
     if (error instanceof LostLease) return;
     if (error instanceof Refusal) {
@@ -202,6 +268,18 @@ export async function drain(
       await processJob(s, api, c, job);
       inbox++;
     }
+  if (
+    c.enabled &&
+    c.celebrationsEnabled &&
+    c.celebrationsStartAt &&
+    Date.now() < until
+  ) {
+    try {
+      await scheduleCelebrations(s, api, c);
+    } catch {
+      console.error("pizza_celebration_scheduling_unavailable");
+    }
+  }
   while (outbox < limit && Date.now() < until) {
     const job = (await s.claim("pizza_outbox", c.team)) as Outbox | null;
     if (!job) break;

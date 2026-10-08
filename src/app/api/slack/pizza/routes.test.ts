@@ -372,4 +372,78 @@ describe("signed durable Slack routes", () => {
       ).status,
     ).toBe(200);
   });
+  it("preset reward modals start at 6/8/12 and accept explicitly edited tier prices", async () => {
+    mock.identity.mockResolvedValue({ id: "U9", team_id: "T1" });
+    for (const [tier, cost] of [
+      ["small", 6],
+      ["medium", 8],
+      ["large", 12],
+    ] as const) {
+      const payload = interaction({
+        user: { id: "U9" },
+        actions: [{ action_id: `pizza_add_${tier}`, value: "new" }],
+      });
+      expect((await interactions(request(form(payload), true))).status).toBe(
+        200,
+      );
+      const modal = mock.modal.mock.calls.at(-1)![1];
+      expect(JSON.stringify(modal)).toContain(`"initial_value":"${cost}"`);
+    }
+    const submit = interaction({
+      type: "view_submission",
+      user: { id: "U9" },
+      view: {
+        id: "tier-view",
+        callback_id: "pizza_catalogue",
+        private_metadata: "new",
+        state: {
+          values: {
+            name: { value: { value: "Georgia's prize" } },
+            cost: { value: { value: "7" } },
+            tier: { value: { selected_option: { value: "large" } } },
+          },
+        },
+      },
+    });
+    expect((await interactions(request(form(submit), true))).status).toBe(200);
+    expect(mock.enqueue).toHaveBeenLastCalledWith(
+      "T1",
+      expect.any(String),
+      "catalogue",
+      expect.objectContaining({ tier: "large", cost: 7, user: "U9" }),
+    );
+  });
+  it("goal actions persist the signed actor rather than any spoofed payload user, without a modal trigger", async () => {
+    const payload = interaction({
+      actions: [{ action_id: "pizza_goal", value: id, user: "U9" }],
+      trigger_id: undefined,
+    });
+    expect((await interactions(request(form(payload), true))).status).toBe(200);
+    expect(mock.enqueue).toHaveBeenCalledWith(
+      "T1",
+      expect.any(String),
+      "goal",
+      expect.objectContaining({
+        user: "U2",
+        reward: id,
+        responseUrl: "https://hooks.slack.com/actions/T1/token",
+      }),
+    );
+    expect(mock.modal).not.toHaveBeenCalled();
+    const clear = interaction({
+      actions: [{ action_id: "pizza_goal_clear", value: "clear" }],
+    });
+    expect((await interactions(request(form(clear), true))).status).toBe(200);
+    expect(mock.enqueue).toHaveBeenLastCalledWith(
+      "T1",
+      expect.any(String),
+      "goal",
+      expect.objectContaining({ user: "U2", reward: null }),
+    );
+    const foreign = interaction({
+      team: { id: "T2" },
+      actions: [{ action_id: "pizza_goal", value: id }],
+    });
+    expect((await interactions(request(form(foreign), true))).status).toBe(403);
+  });
 });

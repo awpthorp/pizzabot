@@ -28,6 +28,28 @@ const fixtures = () => {
     balance: vi
       .fn()
       .mockResolvedValue({ earned: 10, balance: 3, remaining: 4 }),
+    goal: vi.fn().mockResolvedValue(null),
+    setGoal: vi.fn(),
+    celebrationSnapshot: vi.fn().mockResolvedValue({
+      received: [],
+      given: [],
+      messages: 0,
+      slices: 0,
+      givers: 0,
+      recipients: 0,
+      participants: 0,
+      highlights: [],
+    }),
+    queueCelebration: vi.fn(),
+    leaderboard: vi
+      .fn<
+        (
+          ...args: unknown[]
+        ) => Promise<
+          { user_id: string; slices: number; teammates: number; rank: number }[]
+        >
+      >()
+      .mockResolvedValue([]),
     rewards: vi.fn().mockResolvedValue([]),
     adminState: vi.fn().mockResolvedValue({ requests: [], deliveries: [] }),
   };
@@ -96,11 +118,14 @@ describe("recoverable worker", () => {
   it("balance is private and distinguishes earned, spendable and giving", async () => {
     const f = fixtures();
     await processJob(f.s, f.slack, c, j);
-    expect(f.storage.finish).toHaveBeenCalledWith(j, {
-      text: expect.stringMatching(
-        /Lifetime earned: 10.*\nAvailable to spend: 3.*\nLeft to give today: 4\/5/,
-      ),
-    });
+    expect(f.storage.finish).toHaveBeenCalledWith(
+      j,
+      expect.objectContaining({
+        text: expect.stringMatching(
+          /Lifetime earned: 10 slices.*\nAvailable to spend: 3 slices.*\nLeft to give today: 4\/5/,
+        ),
+      }),
+    );
   });
   it("refusal becomes durable private feedback; transient DB/Slack failures retry", async () => {
     const f = fixtures();
@@ -171,5 +196,101 @@ describe("recoverable worker", () => {
     expect(JSON.stringify(result)).toMatch(/pizza_fulfill/);
     expect(JSON.stringify(result)).toMatch(/pizza_cancel/);
     expect(JSON.stringify(result)).toMatch(/Ambiguous delivery outbox/);
+  });
+  it("current admin previews remain private and create no scheduling receipt", async () => {
+    const f = fixtures();
+    f.api.identity.mockResolvedValue({ id: "U9", team_id: "T1" });
+    const preview = {
+      ...j,
+      payload: { user: "U9", channel: "G2", text: "admin preview week" },
+    };
+    await processJob(
+      f.s,
+      f.slack,
+      {
+        ...c,
+        celebrationsEnabled: true,
+        celebrationsStartAt: new Date("2026-10-08T00:00:00Z"),
+      },
+      preview,
+    );
+    expect(f.storage.finish).toHaveBeenCalledWith(
+      preview,
+      expect.objectContaining({
+        text: expect.stringContaining("Private current week preview"),
+      }),
+      false,
+      "preview",
+    );
+    expect(f.storage.queueCelebration).not.toHaveBeenCalled();
+    const denied = {
+      ...j,
+      payload: { user: "U2", text: "admin preview month" },
+    };
+    await processJob(f.s, f.slack, c, denied);
+    expect(f.storage.finish).toHaveBeenCalledWith(
+      denied,
+      { text: expect.stringMatching(/Only configured admins/) },
+      true,
+    );
+  });
+  it("goal jobs bind the authenticated user", async () => {
+    const f = fixtures(),
+      goal = { ...j, kind: "goal", payload: { user: "U2", reward: "reward" } };
+    await processJob(f.s, f.slack, c, goal);
+    expect(f.storage.setGoal).toHaveBeenCalledWith(
+      goal,
+      { id: "U2", team_id: "T1" },
+      c,
+    );
+  });
+  it("leaderboard commands preserve defaults, route week/given and reject invalid arguments privately", async () => {
+    const f = fixtures();
+    const command = (text: string) => ({ ...j, payload: { user: "U2", text } });
+    await processJob(f.s, f.slack, c, command("leaderboard"));
+    expect(f.storage.leaderboard).toHaveBeenLastCalledWith(
+      "T1",
+      expect.objectContaining({ kind: "month" }),
+      "received",
+    );
+    expect(f.storage.finish).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        text: expect.stringContaining("Received recognition leaderboard"),
+      }),
+    );
+    f.storage.leaderboard.mockResolvedValue([
+      { user_id: "U1", slices: 5, teammates: 2, rank: 1 },
+      { user_id: "U3", slices: 5, teammates: 3, rank: 1 },
+      { user_id: "U4", slices: 2, teammates: 1, rank: 3 },
+    ]);
+    await processJob(f.s, f.slack, c, command("leaderboard week given"));
+    expect(f.storage.leaderboard).toHaveBeenLastCalledWith(
+      "T1",
+      expect.objectContaining({
+        kind: "week",
+        label: expect.stringContaining("Asia/Dubai (end exclusive)"),
+      }),
+      "given",
+    );
+    expect(f.storage.finish).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        text: expect.stringContaining(
+          "1. <@U1> — 5 slices · 2 teammates thanked\n1. <@U3> — 5 slices · 3 teammates thanked\n3. <@U4> — 2 slices · 1 teammates thanked",
+        ),
+      }),
+    );
+    f.storage.leaderboard.mockClear();
+    for (const text of ["leaderboard year given", "leaderboard week spent"]) {
+      const invalid = command(text);
+      await processJob(f.s, f.slack, c, invalid);
+      expect(f.storage.finish).toHaveBeenLastCalledWith(
+        invalid,
+        { text: expect.stringContaining("Use /pizza leaderboard") },
+        true,
+      );
+    }
+    expect(f.storage.leaderboard).not.toHaveBeenCalled();
   });
 });

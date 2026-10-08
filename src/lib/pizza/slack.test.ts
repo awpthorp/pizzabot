@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
-import { PizzaSlack, SlackTransient } from "./slack";
+import { PizzaSlack, SlackTransient, validPermalink } from "./slack";
 import { config } from "./config";
 import { type Outbox } from "./store";
 const mock = vi.hoisted(() => ({
@@ -8,6 +8,7 @@ const mock = vi.hoisted(() => ({
   post: vi.fn(),
   ephemeral: vi.fn(),
   modal: vi.fn(),
+  permalink: vi.fn(),
   constructor: vi.fn(),
 }));
 vi.mock("@slack/web-api", () => ({
@@ -17,7 +18,11 @@ vi.mock("@slack/web-api", () => ({
     }
     users = { info: mock.user };
     conversations = { info: mock.channel };
-    chat = { postMessage: mock.post, postEphemeral: mock.ephemeral };
+    chat = {
+      postMessage: mock.post,
+      postEphemeral: mock.ephemeral,
+      getPermalink: mock.permalink,
+    };
     views = { open: mock.modal };
   },
 }));
@@ -89,6 +94,28 @@ describe("dedicated bounded Slack client", () => {
       channel: { is_private: true, is_member: true },
     });
     expect(await new PizzaSlack(c).channel("G2", false)).toBe(true);
+  });
+  it("validates Slack message permalinks, including threads, and omits deleted/unavailable links", async () => {
+    const url =
+      "https://gr.slack.com/archives/C1/p1791489600000001?thread_ts=1791489500.000001&cid=C1";
+    expect(validPermalink(url, "C1")).toBe(url);
+    for (const invalid of [
+      "https://evil.example/archives/C1/p1",
+      "http://gr.slack.com/archives/C1/p1",
+      "https://gr.slack.com/archives/C2/p1",
+      "https://user@gr.slack.com/archives/C1/p1",
+      "https://gr.slack.com/archives/C1/p1|bad",
+    ])
+      expect(validPermalink(invalid, "C1")).toBeNull();
+    const api = new PizzaSlack(c);
+    mock.permalink.mockResolvedValue({ permalink: url });
+    expect(await api.permalink("C1", "1791489600.000001")).toBe(url);
+    expect(mock.permalink).toHaveBeenCalledWith({
+      channel: "C1",
+      message_ts: "1791489600.000001",
+    });
+    mock.permalink.mockRejectedValue({ data: { error: "message_not_found" } });
+    expect(await api.permalink("C1", "1791489600.000001")).toBeNull();
   });
   it("response delivery rejects redirects and sends private responses, honours rate-limit delay", async () => {
     const api = new PizzaSlack(c),

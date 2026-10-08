@@ -1,13 +1,13 @@
+import {
+  TIERS,
+  tierLabel,
+  progressMeter,
+  tierGuide,
+  type Tier,
+} from "./rewards";
+import type { Reward } from "./store";
 export const help =
-  "Give recognition in the pizza channel: <@USER> 🍕 thanks! Every unique direct mention receives the total pizzas in the text: @Mike @Sarah 🍕🍕 costs four. Five to give per Dubai calendar day; receiving never replenishes giving. No self gifts, guests, bots, external users, code, quotes, attachments, edits or reactions. Original thread replies count. Editing/deleting an accepted message does not alter points. Redemption spends available points but never lifetime earned. /pizza balance | leaderboard [month|all] | rewards | help. Admins: /pizza admin.";
-type Reward = {
-  id: string;
-  name: string;
-  cost: number;
-  description: string;
-  active: boolean;
-  stock: number | null;
-};
+  "Give recognition in the pizza channel: <@USER> 🍕 thanks! Every unique direct mention receives the total pizzas in the text: @Mike @Sarah 🍕🍕 costs four. Five to give per Dubai calendar day; receiving never replenishes giving. No self gifts, guests, bots, external users, code, quotes, attachments, edits or reactions. Original thread replies count. Editing/deleting an accepted message does not alter earned slices. One received 🍕 is one slice. Redemption spends available slices but never lifetime earned. /pizza balance | leaderboard [week|month|all] [received|given] | rewards | goal clear | help. Track a reward for personal progress; tracking never spends slices. Admins: /pizza admin and /pizza admin preview [week|month].";
 const plain = (text: string) => ({
   type: "plain_text",
   text: text.slice(0, 2000),
@@ -34,7 +34,16 @@ export function rewardsBlocks(rewards: Reward[], admin = false) {
       ? [
           {
             type: "actions",
-            elements: [button("Add reward", "pizza_add", "new")],
+            elements: [
+              button("Add custom", "pizza_add", "new"),
+              ...Object.entries(TIERS).map(([tier, cost]) =>
+                button(
+                  `Add ${tierLabel(tier as Tier)} (${cost})`,
+                  `pizza_add_${tier}`,
+                  "new",
+                ),
+              ),
+            ],
           },
         ]
       : []),
@@ -42,7 +51,7 @@ export function rewardsBlocks(rewards: Reward[], admin = false) {
       {
         type: "section",
         text: plain(
-          `${r.name} — ${r.cost} 🍕\n${r.description}\n${r.stock === null ? "Unlimited stock" : `${r.stock} available`}${r.active ? "" : " (archived)"}`,
+          `${r.name} — ${tierLabel(r.tier)} · ${r.cost} slices\n${r.description}\n${r.stock === null ? "Unlimited stock" : `${r.stock} available`}${r.active ? "" : " (archived)"}`,
         ),
       },
       {
@@ -56,7 +65,10 @@ export function rewardsBlocks(rewards: Reward[], admin = false) {
                 r.id,
               ),
             ]
-          : [button("Redeem", "pizza_redeem", r.id)],
+          : [
+              button("Track reward", "pizza_goal", r.id),
+              button("Redeem", "pizza_redeem", r.id),
+            ],
       },
     ]),
   ];
@@ -79,7 +91,7 @@ export function redemptionBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `Request ${id}\nStaff: <@${user}>\nReward: ${escapeSlackText(name)}\nCharged: ${cost} 🍕\n${escapeSlackText(description.slice(0, 400))}`,
+        text: `Request ${id}\nStaff: <@${user}>\nReward: ${escapeSlackText(name)}\nCharged: ${cost} slices\n${escapeSlackText(description.slice(0, 400))}`,
       },
     },
     ...(description.length > 400
@@ -107,13 +119,13 @@ export function confirmationModal(intent: string, r: Reward, balance: number) {
       {
         type: "section",
         text: plain(
-          `${r.name}\nCost: ${r.cost} 🍕\nAvailable: ${balance} 🍕\nAfter redemption: ${balance - r.cost} 🍕\n${r.description}`,
+          `${r.name}\nCost: ${r.cost} slices\nAvailable: ${balance} slices\nAfter redemption: ${balance - r.cost} slices\n${r.description}`,
         ),
       },
     ],
   };
 }
-export function rewardModal(r?: Reward) {
+export function rewardModal(r?: Reward, preset?: Tier) {
   const input = (
     id: string,
     label: string,
@@ -130,6 +142,15 @@ export function rewardModal(r?: Reward) {
       ...(value ? { initial_value: value } : {}),
     },
   });
+  const selected = r?.tier ?? preset ?? "custom";
+  const options = ["custom", ...Object.keys(TIERS)].map((tier) => ({
+    text: plain(
+      tier === "custom"
+        ? "Custom"
+        : `${tierLabel(tier as Tier)} (guide: ${TIERS[tier as Tier]} slices)`,
+    ),
+    value: tier,
+  }));
   return {
     type: "modal" as const,
     callback_id: "pizza_catalogue",
@@ -139,7 +160,30 @@ export function rewardModal(r?: Reward) {
     close: plain("Cancel"),
     blocks: [
       input("name", "Name", r?.name ?? ""),
-      input("cost", "Pizza cost", r ? String(r.cost) : ""),
+      {
+        type: "input",
+        block_id: "tier",
+        label: plain("Reward tier"),
+        element: {
+          type: "static_select",
+          action_id: "value",
+          options,
+          initial_option: options.find((option) => option.value === selected),
+        },
+      },
+      input(
+        "cost",
+        "Cost in slices (edit explicitly)",
+        r ? String(r.cost) : preset ? String(TIERS[preset]) : "",
+      ),
+      {
+        type: "context",
+        elements: [
+          plain(
+            "Changing tier does not change cost. Choose the actual prize name and fulfilment below.",
+          ),
+        ],
+      },
       input(
         "description",
         "Fulfilment description",
@@ -154,4 +198,20 @@ export function rewardModal(r?: Reward) {
       ),
     ],
   };
+}
+
+export function goalText(balance: number, reward: Reward | null): string {
+  if (!reward) return tierGuide;
+  const availability = !reward.active
+    ? "This goal is archived."
+    : reward.stock === 0
+      ? "This goal is sold out."
+      : "";
+  const remaining = Math.max(0, reward.cost - balance);
+  return [
+    `Tracking: ${escapeSlackText(reward.name)} · ${tierLabel(reward.tier)} · current cost ${reward.cost} slices`,
+    `${progressMeter(balance, reward.cost)}${reward.cost > 12 ? " (12-cell proportional view)" : " (one cell per slice)"}`,
+    `${balance}/${reward.cost} available slices. ${availability || (remaining ? `${remaining} more slices to reach the current cost.` : "Ready to redeem via /pizza rewards.")}`,
+    "Tracking never spends or reserves slices. Use /pizza rewards to change your goal or /pizza goal clear to remove it.",
+  ].join("\n");
 }

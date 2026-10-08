@@ -76,6 +76,17 @@ export class PizzaSlack {
       throw slackFailure(e);
     }
   }
+  async permalink(channel: string, timestamp: string): Promise<string | null> {
+    try {
+      const result = await this.client.chat.getPermalink({
+        channel,
+        message_ts: timestamp,
+      });
+      return validPermalink(result.permalink, channel);
+    } catch {
+      return null;
+    } // Deleted/stale/rate-limited highlights never block the recap.
+  }
   async deliver(job: Outbox): Promise<string | undefined> {
     const target = job.target;
     if (!target) throw new Refusal("No delivery target.");
@@ -172,4 +183,21 @@ export function slack(c: PizzaConfig) {
   if (!cached || cached.token !== c.token)
     cached = { token: c.token, slack: new PizzaSlack(c) };
   return cached.slack;
+}
+
+export function validPermalink(value: unknown, channel: string): string | null {
+  if (typeof value !== "string" || /[<>|\s]/.test(value)) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      /^[a-z0-9-]+\.(slack\.com|slack-gov\.com)$/i.test(url.hostname) &&
+      new RegExp(`^/archives/${channel}/p[0-9]+$`).test(url.pathname)
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
 }

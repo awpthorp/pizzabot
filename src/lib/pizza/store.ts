@@ -4,6 +4,9 @@ import { type PizzaConfig, DAILY_LIMIT } from "./config";
 import { type AwardInput } from "./parser";
 import { type Identity, eligible, localDay, rejection } from "./policy";
 import { redemptionBlocks, escapeSlackText } from "./blocks";
+import { type Period, rankStandings } from "./periods";
+import { type CelebrationSnapshot } from "./celebrations";
+import { isTier, type Tier } from "./rewards";
 
 export type Job = {
   id: string;
@@ -32,6 +35,7 @@ export type Reward = {
   description: string;
   stock: number | null;
   active: boolean;
+  tier?: Tier | null;
 };
 export class Refusal extends Error {}
 export class LostLease extends Error {}
@@ -80,7 +84,8 @@ export class PizzaStore {
   ) {
     return (
       await this.db.query(
-        "INSERT INTO pizza_inbox(id,team_id,event_id,kind,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(team_id,event_id) DO NOTHING RETURNING id",
+        `WITH locked AS (SELECT CASE WHEN $4='award' THEN pg_advisory_xact_lock(hashtextextended($2||':celebration-schedule',0)) END)
+         INSERT INTO pizza_inbox(id,team_id,event_id,kind,payload) SELECT $1,$2,$3,$4,$5 FROM locked ON CONFLICT(team_id,event_id) DO NOTHING RETURNING id`,
         [randomUUID(), team, event, kind, payload],
       )
     ).rows[0]?.id;
@@ -254,7 +259,7 @@ export class PizzaStore {
         {
           text:
             reject ??
-            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} 🍕 each. You have ${DAILY_LIMIT - used - a.total} left to give for ${day} (Asia/Dubai).`,
+            `${a.recipients.map((u) => `<@${u}>`).join(", ")} received ${a.amount} slices each (1 🍕 = 1 slice). You have ${DAILY_LIMIT - used - a.total} left to give for ${day} (Asia/Dubai).`,
         },
       );
       await this.complete(client, job, !!reject);
@@ -281,13 +286,192 @@ export class PizzaStore {
       remaining: number;
     };
   }
-  async leaderboard(team: string, all: boolean) {
-    return (
+  async leaderboard(
+    team: string,
+    p: Period,
+    mode: "received" | "given" = "received",
+  ) {
+    const snapshot = await this.celebrationSnapshot(team, p);
+    return (mode === "received" ? snapshot.received : snapshot.given).slice(
+      0,
+      10,
+    );
+  }
+  async celebrationSnapshot(
+    team: string,
+    p: Period,
+  ): Promise<CelebrationSnapshot> {
+    const result = (
       await this.db.query(
-        "SELECT r.recipient_id, SUM(r.amount)::int earned FROM pizza_award_recipients r JOIN pizza_awards a ON a.id=r.award_id AND a.team_id=r.team_id WHERE a.team_id=$1 AND a.result='accepted' AND ($2::boolean OR a.local_day>=date_trunc('month',$3::date)::date AND a.local_day<(date_trunc('month',$3::date)+interval '1 month')::date) GROUP BY r.recipient_id ORDER BY earned DESC,r.recipient_id ASC LIMIT 10",
-        [team, all, localDay()],
+        `WITH awards AS (
+      SELECT * FROM pizza_awards WHERE team_id=$1 AND result='accepted'
+        AND ($2::numeric IS NULL OR message_ts::numeric >= $2::numeric)
+        AND ($3::numeric IS NULL OR message_ts::numeric < $3::numeric)
+    ), recipients AS (SELECT r.* FROM pizza_award_recipients r JOIN awards a ON a.id=r.award_id AND a.team_id=r.team_id),
+    received AS (SELECT recipient_id AS user_id,sum(amount)::int AS slices FROM recipients GROUP BY recipient_id),
+    given AS (SELECT giver_id AS user_id,sum(total)::int AS slices FROM awards GROUP BY giver_id),
+    teammates AS (SELECT a.giver_id AS user_id,count(DISTINCT r.recipient_id)::int AS teammates FROM awards a JOIN recipients r ON r.award_id=a.id GROUP BY a.giver_id),
+    people AS (SELECT giver_id AS user_id FROM awards UNION SELECT recipient_id FROM recipients),
+    highlights AS (
+      SELECT a.id,a.channel_id AS channel,a.message_ts AS ts,chosen.recipient_id AS recipient,a.reason FROM awards a
+      JOIN LATERAL (SELECT recipient_id FROM recipients r WHERE r.award_id=a.id ORDER BY md5(r.recipient_id||$4) LIMIT 1) chosen ON true
+      WHERE a.reason IS NOT NULL AND length(trim(a.reason))>0 ORDER BY md5(a.id::text||$4),a.id LIMIT 20
+    )
+    SELECT (SELECT count(*)::int FROM awards) AS messages,COALESCE((SELECT sum(total)::int FROM awards),0) AS slices,
+      (SELECT count(*)::int FROM given) AS givers,(SELECT count(*)::int FROM received) AS recipients,(SELECT count(*)::int FROM people) AS participants,
+      COALESCE((SELECT jsonb_agg(received ORDER BY slices DESC,user_id) FROM received),'[]') AS received,
+      COALESCE((SELECT jsonb_agg(gs ORDER BY slices DESC,user_id) FROM (SELECT given.*,teammates.teammates FROM given JOIN teammates USING(user_id)) gs),'[]') AS given,
+      COALESCE((SELECT jsonb_agg(highlights) FROM highlights),'[]') AS highlights`,
+        [
+          team,
+          p.start ? String(p.start.getTime() / 1000) : null,
+          p.end ? String(p.end.getTime() / 1000) : null,
+          p.key,
+        ],
       )
-    ).rows as { recipient_id: string; earned: number }[];
+    ).rows[0];
+    return {
+      ...result,
+      received: rankStandings(result.received),
+      given: rankStandings(result.given),
+    };
+  }
+  private async pendingAwards(
+    client: Pick<PoolClient, "query">,
+    team: string,
+    p: Period,
+  ) {
+    return !!(
+      await client.query(
+        `SELECT 1 FROM pizza_inbox WHERE team_id=$1 AND kind='award' AND status IN('pending','running')
+      AND (payload->>'ts')::numeric >= $2::numeric AND (payload->>'ts')::numeric < $3::numeric LIMIT 1`,
+        [
+          team,
+          String(p.start!.getTime() / 1000),
+          String(p.end!.getTime() / 1000),
+        ],
+      )
+    ).rowCount;
+  }
+  async celebrationReady(team: string, p: Period) {
+    if (
+      (
+        await this.db.query(
+          "SELECT 1 FROM pizza_celebrations WHERE team_id=$1 AND period_kind=$2 AND period_start=$3",
+          [team, p.kind, p.start],
+        )
+      ).rowCount
+    )
+      return false;
+    return !(await this.pendingAwards(this.db, team, p));
+  }
+  async queueCelebration(
+    team: string,
+    p: Period,
+    sourceCount: number,
+    payload: Record<string, unknown>,
+    channel: string,
+  ): Promise<boolean> {
+    if (p.kind === "all" || !p.start || !p.end || !p.due)
+      throw new Refusal("A completed week or month is required.");
+    return this.tx(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        [`${team}:celebration-schedule`],
+      );
+      if (await this.pendingAwards(client, team, p)) return false;
+      const count = (
+        await client.query(
+          "SELECT count(*)::int count FROM pizza_awards WHERE team_id=$1 AND result='accepted' AND message_ts::numeric >=$2::numeric AND message_ts::numeric <$3::numeric",
+          [
+            team,
+            String(p.start!.getTime() / 1000),
+            String(p.end!.getTime() / 1000),
+          ],
+        )
+      ).rows[0].count;
+      if (count !== sourceCount) return false; // Award committed while permalink lookup ran: rebuild on the next drain.
+      const key = `celebration:${p.key}`;
+      const receipt = await client.query(
+        "INSERT INTO pizza_celebrations(team_id,period_kind,period_start,period_end,due_at,notification_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING period_start",
+        [team, p.kind, p.start, p.end, p.due, key],
+      );
+      if (!receipt.rowCount) return false;
+      await this.notify(
+        client,
+        team,
+        key,
+        { kind: "message", channel },
+        payload,
+      );
+      return true;
+    });
+  }
+  async goal(team: string, user: string): Promise<Reward | null> {
+    return (
+      (
+        await this.db.query(
+          "SELECT r.* FROM pizza_reward_goals g JOIN pizza_rewards r ON r.team_id=g.team_id AND r.id=g.reward_id WHERE g.team_id=$1 AND g.user_id=$2",
+          [team, user],
+        )
+      ).rows[0] ?? null
+    );
+  }
+  async setGoal(job: Job, actor: Identity, c: PizzaConfig) {
+    if (
+      !eligible(actor, c) ||
+      actor.id !== job.payload.user ||
+      job.team_id !== c.team
+    )
+      throw new Refusal(
+        "Only eligible staff can choose their own reward goal.",
+      );
+    return this.tx(async (client) => {
+      await this.guard(client, job);
+      let text: string;
+      if (job.payload.reward === null) {
+        await client.query(
+          "DELETE FROM pizza_reward_goals WHERE team_id=$1 AND user_id=$2",
+          [job.team_id, actor.id],
+        );
+        text = "Reward goal cleared. Use /pizza rewards to choose another.";
+      } else {
+        const r = (
+          await client.query(
+            "SELECT * FROM pizza_rewards WHERE team_id=$1 AND id=$2 FOR SHARE",
+            [job.team_id, job.payload.reward],
+          )
+        ).rows[0];
+        if (!r?.active || r.stock === 0)
+          throw new Refusal(
+            "Choose an active, available reward from /pizza rewards.",
+          );
+        await client.query(
+          "INSERT INTO pizza_reward_goals(team_id,user_id,reward_id) VALUES($1,$2,$3) ON CONFLICT(team_id,user_id) DO UPDATE SET reward_id=excluded.reward_id,updated_at=now()",
+          [job.team_id, actor.id, r.id],
+        );
+        text = `Now tracking ${escapeSlackText(r.name)} (${r.cost} slices). Use /pizza balance for progress. Tracking does not spend or reserve slices.`;
+      }
+      const url =
+        typeof job.payload.responseUrl === "string"
+          ? job.payload.responseUrl
+          : null;
+      await this.notify(
+        client,
+        job.team_id,
+        `goal:${job.id}`,
+        url
+          ? { kind: "response", url }
+          : {
+              kind: "ephemeral",
+              channel: job.payload.channel ?? c.recognitionChannel,
+              user: actor.id,
+            },
+        { text },
+        url ? new Date(Number(job.payload.responseExpires)) : undefined,
+      );
+      await this.complete(client, job);
+    });
   }
   async rewards(team: string, admin = false, page = 0): Promise<Reward[]> {
     return (
@@ -326,7 +510,7 @@ export class PizzaStore {
         [team, user, reward, id],
       )
     ).rows[0];
-    if (!row) throw new Refusal("Reward unavailable or insufficient pizzas.");
+    if (!row) throw new Refusal("Reward unavailable or insufficient slices.");
     return row;
   }
   async checkIntent(team: string, user: string, id: string) {
@@ -375,7 +559,7 @@ export class PizzaStore {
           "The price changed. Open rewards and confirm the new price.",
         );
       if (account.balance < r.cost)
-        throw new Refusal("You do not have enough pizzas.");
+        throw new Refusal("You do not have enough slices.");
       const id = randomUUID();
       await client.query(
         "INSERT INTO pizza_redemptions(id,team_id,intent_id,user_id,reward_id,cost,reward_name,description,reserved_stock) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
@@ -414,7 +598,7 @@ export class PizzaStore {
         `request:${id}`,
         { kind: "message", channel: c.adminChannel },
         {
-          text: `Reward request ${id}: <@${user.id}> — ${escapeSlackText(r.name)} (${r.cost} 🍕)`,
+          text: `Reward request ${id}: <@${user.id}> — ${escapeSlackText(r.name)} (${r.cost} slices)`,
           blocks: redemptionBlocks(id, user.id, r.name, r.cost, r.description),
         },
       );
@@ -428,7 +612,7 @@ export class PizzaStore {
           user: user.id,
         },
         {
-          text: `Request ${id} is pending. ${r.cost} 🍕 deducted. An admin will fulfil it.`,
+          text: `Request ${id} is pending. ${r.cost} slices deducted. An admin will fulfil it.`,
         },
       );
       await this.complete(client, job);
@@ -486,7 +670,7 @@ export class PizzaStore {
           `status:${r.id}`,
           { kind: "message", channel: c.adminChannel },
           {
-            text: `Request ${r.id}: ${status} by <@${actor.id}>${status === "cancelled" ? `; ${r.cost} 🍕 refunded` : ""}.`,
+            text: `Request ${r.id}: ${status} by <@${actor.id}>${status === "cancelled" ? `; ${r.cost} slices refunded` : ""}.`,
           },
         );
         await this.notify(
@@ -495,7 +679,7 @@ export class PizzaStore {
           `user-status:${r.id}`,
           { kind: "ephemeral", channel: c.recognitionChannel, user: r.user_id },
           {
-            text: `Request ${r.id} (${escapeSlackText(r.reward_name)}): ${status}${status === "cancelled" ? `; ${r.cost} 🍕 refunded` : ""}.`,
+            text: `Request ${r.id} (${escapeSlackText(r.reward_name)}): ${status}${status === "cancelled" ? `; ${r.cost} slices refunded` : ""}.`,
           },
         );
       }
@@ -516,7 +700,9 @@ export class PizzaStore {
         if (!result.rowCount) throw new Refusal("Unknown reward.");
       } else {
         const { name, cost, description, stock } = job.payload;
+        const tier = job.payload.tier ?? null;
         if (
+          (tier !== null && !isTier(tier)) ||
           typeof name !== "string" ||
           !name.trim() ||
           name.length > 100 ||
@@ -535,12 +721,20 @@ export class PizzaStore {
           throw new Refusal("Invalid reward values.");
         if (job.payload.reward === "new")
           await client.query(
-            "INSERT INTO pizza_rewards(id,team_id,name,cost,description,stock) VALUES($1,$2,$3,$4,$5,$6)",
-            [randomUUID(), job.team_id, name.trim(), cost, description, stock],
+            "INSERT INTO pizza_rewards(id,team_id,name,cost,description,stock,tier) VALUES($1,$2,$3,$4,$5,$6,$7)",
+            [
+              randomUUID(),
+              job.team_id,
+              name.trim(),
+              cost,
+              description,
+              stock,
+              tier,
+            ],
           );
         else {
           const result = await client.query(
-            "UPDATE pizza_rewards SET name=$3,cost=$4,description=$5,stock=$6 WHERE team_id=$1 AND id=$2 RETURNING id",
+            "UPDATE pizza_rewards SET name=$3,cost=$4,description=$5,stock=$6,tier=$7 WHERE team_id=$1 AND id=$2 RETURNING id",
             [
               job.team_id,
               job.payload.reward,
@@ -548,6 +742,7 @@ export class PizzaStore {
               cost,
               description,
               stock,
+              tier,
             ],
           );
           if (!result.rowCount) throw new Refusal("Unknown reward.");
@@ -563,7 +758,12 @@ export class PizzaStore {
       await this.complete(client, job);
     });
   }
-  async finish(job: Job, payload?: Record<string, unknown>, reject = false) {
+  async finish(
+    job: Job,
+    payload?: Record<string, unknown>,
+    reject = false,
+    namespace: "result" | "preview" = "result",
+  ) {
     return this.tx(async (client) => {
       await this.guard(client, job);
       if (payload) {
@@ -574,7 +774,7 @@ export class PizzaStore {
         await this.notify(
           client,
           job.team_id,
-          `result:${job.id}`,
+          `${namespace}:${job.id}`,
           url
             ? { kind: "response", url }
             : {
@@ -645,10 +845,18 @@ export class PizzaStore {
     if (job.target?.kind === "response")
       await this.db.query(
         "UPDATE pizza_inbox SET payload=payload-'responseUrl' WHERE team_id=$1 AND id::text=$2",
-        [job.team_id, job.notification_key?.replace("result:", "") ?? ""],
+        [
+          job.team_id,
+          job.notification_key?.replace(/^(result|goal|preview):/, "") ?? "",
+        ],
       );
   }
   async maintenance(team: string) {
+    await this.db.query(
+      "UPDATE pizza_outbox SET payload=jsonb_build_object('text','Celebration content removed after 30 days.') WHERE team_id=$1 AND (notification_key LIKE 'celebration:%' OR notification_key LIKE 'preview:%') AND status IN('sent','expired','ambiguous') AND created_at<now()-interval '30 days' AND payload ? 'blocks'",
+      [team],
+    );
+
     await this.db.query(
       "UPDATE pizza_inbox SET payload=NULL WHERE team_id=$1 AND status IN('complete','rejected') AND completed_at<now()-interval '30 days' AND payload IS NOT NULL",
       [team],
