@@ -1,6 +1,6 @@
 # PizzaBot technical architecture
 
-Last documented: 8 October 2026. This document describes the deployed design; [the plain-English guide](how-it-works.md) explains staff use. [README](../README.md) contains the full operational policy and recovery procedure.
+Last documented: 12 October 2026. This document describes the deployed design; [the plain-English guide](how-it-works.md) explains staff use. [README](../README.md) contains the full operational policy and recovery procedure.
 
 ## Boundaries and ownership
 
@@ -73,6 +73,8 @@ Weeks run Friday 16:00 to Friday 16:00 in Asia/Dubai; months are Dubai calendar 
 Global feature/activation gates and the admin's separate weekly/monthly switches control scheduling. The original activation timestamp prevents pre-launch history. Recovery considers only the latest due period for each report type. Do not reset the activation timestamp on a routine deploy.
 
 A unique team/period receipt and the report outbox payload commit together. Accepted pending awards delay the snapshot; a final transaction rechecks them and the report switch. A late Slack event arriving after a report commits does not revise the published report. Turning reports off does not retract an already queued report. Previews are private and create no scheduling receipt.
+
+Recognition excerpts remain plain text to preserve the original wording without triggering quoted mentions. Before rendering, Slack member tokens are resolved to display names (then real names or usernames), with at most twelve cached lookups per report. Missing profiles use `@teammate`, and excerpts are shortened only after names are resolved. Standings and the separate recipient context retain Slack's clickable mentions.
 
 Inbox/outbox leases expire after 60 seconds. Known delivery failures retry with bounded backoff; Slack 429 honours Retry-After. A timeout can be ambiguous because Slack may have accepted the message. Such deliveries wait for operator reconciliation. Accounting is idempotent, but an interrupted notification delivery can produce a duplicate Slack message. Never resubmit an award, correction or redemption to repair notification delivery.
 

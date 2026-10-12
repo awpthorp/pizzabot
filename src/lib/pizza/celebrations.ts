@@ -26,12 +26,22 @@ export type CelebrationSnapshot = {
   highlights: Highlight[];
 };
 export type LinkedHighlight = Highlight & { url: string };
+function readableExcerpt(reason: string, names = new Map<string, string | null>()): string {
+  return reason
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g, (_, id: string) =>
+      names.get(id) ? `@${names.get(id)}` : "@teammate",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
 export async function linkedHighlights(
   api: PizzaSlack,
   snapshot: CelebrationSnapshot,
 ): Promise<LinkedHighlight[]> {
   const result: LinkedHighlight[] = [];
   const candidates = [...snapshot.highlights];
+  const names = new Map<string, string | null>();
   // A bounded number of attempts; missing links never strand the celebration.
   for (
     let attempt = 0;
@@ -43,7 +53,16 @@ export async function linkedHighlights(
       : 0;
     const [candidate] = candidates.splice(different < 0 ? 0 : different, 1);
     const url = await api.permalink(candidate.channel, candidate.ts);
-    if (url) result.push({ ...candidate, url });
+    if (url) {
+      const ids = [...candidate.reason.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g)]
+        .map((match) => match[1]);
+      for (const id of ids) {
+        // Reuse names across both quotes and cap calls, including failed lookups.
+        if (!names.has(id) && names.size < 12)
+          names.set(id, await api.displayName(id));
+      }
+      result.push({ ...candidate, url, reason: readableExcerpt(candidate.reason, names) });
+    }
   }
   return result;
 }
@@ -84,7 +103,8 @@ export function celebrationPayload(
   highlights: LinkedHighlight[],
   preview = false,
 ): Record<string, unknown> {
-  // Only trusted counters/IDs use mrkdwn. Actual recognition excerpts are literal plain_text.
+  // Only trusted counters/IDs use mrkdwn. Quotes use readable names in plain_text
+  // so old mentions do not become fresh notifications or raw Slack IDs.
   const summary = celebrationText(p, snapshot, preview);
   const blocks: Record<string, unknown>[] = [];
   for (
@@ -97,13 +117,7 @@ export function celebrationPayload(
       text: { type: "mrkdwn", text: summary.slice(offset, offset + 2800) },
     });
   for (const h of highlights.slice(0, 2)) {
-    const quote = h.reason
-      .replace(
-        /[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g,
-        "",
-      )
-      .replace(/\s+/g, " ")
-      .trim();
+    const quote = readableExcerpt(h.reason);
     blocks.push({
       type: "section",
       text: {

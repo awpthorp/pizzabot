@@ -76,6 +76,23 @@ export class PizzaSlack {
       throw slackFailure(e);
     }
   }
+  async displayName(id: string): Promise<string | null> {
+    try {
+      const user = await this.identity(id);
+      if (user.team_id !== this.c.team) return null;
+      for (const value of [user.profile?.display_name, user.profile?.real_name, user.name]) {
+        const name = value
+          ?.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "")
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (name) return name.slice(0, 80);
+      }
+    } catch {
+      // A missing profile or Slack outage must not block a scheduled recap.
+    }
+    return null;
+  }
   async permalink(channel: string, timestamp: string): Promise<string | null> {
     try {
       const result = await this.client.chat.getPermalink({

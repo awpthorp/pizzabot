@@ -49,6 +49,29 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 describe("dedicated bounded Slack client", () => {
+  it("uses readable profile names with real-name/username fallbacks and cached lookups", async () => {
+    const api = new PizzaSlack(c);
+    mock.user.mockResolvedValue({ user: { id: "U1", team_id: "T1", profile: { display_name: " Nadia \u202e ", real_name: "Nadia Khatib" } } });
+    expect(await api.displayName("U1")).toBe("Nadia");
+    expect(await api.displayName("U1")).toBe("Nadia");
+    expect(mock.user).toHaveBeenCalledTimes(1);
+    api.invalidate("U1");
+    mock.user.mockResolvedValue({ user: { id: "U1", team_id: "T1", profile: { display_name: " ", real_name: "Nadia Khatib" } } });
+    expect(await api.displayName("U1")).toBe("Nadia Khatib");
+    api.invalidate("U1");
+    mock.user.mockResolvedValue({ user: { id: "U1", team_id: "T1", name: "nadia" } });
+    expect(await api.displayName("U1")).toBe("nadia");
+  });
+  it("does not block quotes on missing/outside-workspace profiles or Slack errors", async () => {
+    const api = new PizzaSlack(c);
+    expect(await api.displayName("U1")).toBeNull();
+    api.invalidate("U1");
+    mock.user.mockResolvedValue({ user: { id: "U1", team_id: "T2", profile: { display_name: "External" } } });
+    expect(await api.displayName("U1")).toBeNull();
+    api.invalidate("U1");
+    mock.user.mockRejectedValue({ data: { error: "ratelimited" } });
+    expect(await api.displayName("U1")).toBeNull();
+  });
   it("fresh adjustment identity bypasses cached membership", async () => {
     const api = new PizzaSlack(c);
     expect((await api.identity("U1")).is_restricted).toBeUndefined();

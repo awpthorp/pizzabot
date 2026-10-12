@@ -81,10 +81,63 @@ describe("celebrations without fabrication", () => {
     }[];
     const block = blocks.find((b) => b.text?.type === "plain_text")!;
     expect(block.text!.text).toContain("*bold* `code` _name_");
+    expect(block.text!.text).toContain("@teammate");
+    expect(block.text!.text).not.toContain("<@U999>");
     expect(block.text!.text).not.toContain("\u202e");
     expect(block.text!.text.length).toBeLessThan(300);
     expect(String(payload.text)).not.toContain("<@U999>");
     expect(blocks.length).toBeLessThan(50);
+  });
+  it("resolves every mention in group excerpts, reuses names, and keeps quotes non-pinging", async () => {
+    const api = {
+      permalink: vi.fn().mockResolvedValue("https://gr.slack.com/archives/C1/p1"),
+      displayName: vi.fn(async (id: string) => ({ U1: "Nadia", U2: "Georgia Rose" })[id as "U1" | "U2"] ?? null),
+    } as unknown as PizzaSlack;
+    const highlights = [
+      { id: "a", recipient: "U1", reason: "<@U1> 🍕 for the shoot" },
+      { id: "b", recipient: "U2", reason: "<@U1|old-name> <@U2> 🍕 for great work" },
+    ].map((h) => ({ ...h, channel: "C1", ts: h.id }));
+    const selected = await linkedHighlights(api, { ...empty, highlights });
+    expect(selected.map((h) => h.reason)).toEqual([
+      "@Nadia 🍕 for the shoot",
+      "@Nadia @Georgia Rose 🍕 for great work",
+    ]);
+    expect(api.displayName).toHaveBeenCalledTimes(2);
+    const payload = celebrationPayload(week, { ...empty, messages: 1 }, selected);
+    const quotes = (payload.blocks as { text?: { type: string; text: string } }[])
+      .filter((b) => b.text?.type === "plain_text");
+    expect(quotes[1].text!.text).toContain("@Nadia @Georgia Rose");
+    expect(JSON.stringify(quotes)).not.toMatch(/<@[UW]/);
+    expect(JSON.stringify(payload)).toContain("For <@U2>");
+  });
+  it("bounds profile calls and replaces unavailable names without exposing IDs", async () => {
+    const api = {
+      permalink: vi.fn().mockResolvedValue("https://gr.slack.com/archives/C1/p1"),
+      displayName: vi.fn().mockResolvedValue(null),
+    } as unknown as PizzaSlack;
+    const reason = Array.from({ length: 30 }, (_, n) => `<@U${n}>`).join(" ");
+    const selected = await linkedHighlights(api, {
+      ...empty,
+      highlights: [{ id: "a", recipient: "U1", channel: "C1", ts: "1", reason }],
+    });
+    expect(api.displayName).toHaveBeenCalledTimes(12);
+    expect(selected[0].reason).not.toMatch(/<@/);
+    expect(selected[0].reason).toContain("@teammate");
+  });
+  it("shortens resolved display names instead of cutting through a Slack ID", async () => {
+    const api = {
+      permalink: vi.fn().mockResolvedValue("https://gr.slack.com/archives/C1/p1"),
+      displayName: vi.fn().mockResolvedValue("Nadia"),
+    } as unknown as PizzaSlack;
+    const selected = await linkedHighlights(api, {
+      ...empty,
+      highlights: [{ id: "a", recipient: "U1", channel: "C1", ts: "1", reason: "x".repeat(237) + " <@U123456789> 🍕" }],
+    });
+    const payload = celebrationPayload(week, { ...empty, messages: 1 }, selected);
+    const quote = (payload.blocks as { text?: { type: string; text: string } }[])
+      .find((b) => b.text?.type === "plain_text")!.text!.text;
+    expect(quote).toMatch(/ @N…$/);
+    expect(quote).not.toContain("<@");
   });
   it("prefers different recipients/messages and omits stale links with bounded attempts", async () => {
     const highlights = [
