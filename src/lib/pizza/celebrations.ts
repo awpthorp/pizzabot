@@ -26,14 +26,21 @@ export type CelebrationSnapshot = {
   highlights: Highlight[];
 };
 export type LinkedHighlight = Highlight & { url: string };
-function readableExcerpt(reason: string, names = new Map<string, string | null>()): string {
+function excerptText(reason: string): string {
   return reason
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "")
-    .replace(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g, (_, id: string) =>
-      names.get(id) ? `@${names.get(id)}` : "@teammate",
+    // Slack serializes literal &, < and > as entities when reading old blocks.
+    .replace(/&(lt|gt|amp);/g, (_, entity: string) =>
+      entity === "lt" ? "<" : entity === "gt" ? ">" : "&",
     )
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+function readableExcerpt(reason: string, names = new Map<string, string | null>()): string {
+  return excerptText(reason)
+    .replace(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g, (_, id: string) =>
+      names.get(id) ? `@${names.get(id)}` : "@teammate",
+    );
 }
 export async function linkedHighlights(
   api: PizzaSlack,
@@ -54,7 +61,7 @@ export async function linkedHighlights(
     const [candidate] = candidates.splice(different < 0 ? 0 : different, 1);
     const url = await api.permalink(candidate.channel, candidate.ts);
     if (url) {
-      const ids = [...candidate.reason.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g)]
+      const ids = [...excerptText(candidate.reason).matchAll(/<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g)]
         .map((match) => match[1]);
       for (const id of ids) {
         // Reuse names across both quotes and cap calls, including failed lookups.

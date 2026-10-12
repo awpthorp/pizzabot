@@ -95,12 +95,12 @@ describe("celebrations without fabrication", () => {
     } as unknown as PizzaSlack;
     const highlights = [
       { id: "a", recipient: "U1", reason: "<@U1> 🍕 for the shoot" },
-      { id: "b", recipient: "U2", reason: "<@U1|old-name> <@U2> 🍕 for great work" },
+      { id: "b", recipient: "U2", reason: "&lt;@U1|old-name&gt; <@U2> 🍕 for great work &amp; help" },
     ].map((h) => ({ ...h, channel: "C1", ts: h.id }));
     const selected = await linkedHighlights(api, { ...empty, highlights });
     expect(selected.map((h) => h.reason)).toEqual([
       "@Nadia 🍕 for the shoot",
-      "@Nadia @Georgia Rose 🍕 for great work",
+      "@Nadia @Georgia Rose 🍕 for great work & help",
     ]);
     expect(api.displayName).toHaveBeenCalledTimes(2);
     const payload = celebrationPayload(week, { ...empty, messages: 1 }, selected);
