@@ -2,6 +2,9 @@
   "name": "grassroots-pizzabot",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": "22.23.4"
+  },
   "scripts": {
     "dev": "next dev -p 3003",
     "build": "next build",
